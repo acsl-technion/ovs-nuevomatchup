@@ -1,0 +1,1978 @@
+diff --git a/configure.ac b/configure.ac
+index 55e8b509b..6573c684e 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -138,6 +138,7 @@ OVS_CHECK_CXX
+ AX_FUNC_POSIX_MEMALIGN
+ OVS_CHECK_UNBOUND
+ OVS_CHECK_UNWIND
++OVS_CHECK_NUEVOMATCHUP
+ 
+ OVS_CHECK_INCLUDE_NEXT([stdio.h string.h])
+ AC_CONFIG_FILES([
+diff --git a/include/openvswitch/flow.h b/include/openvswitch/flow.h
+index 57b6c925c..546a4d41d 100644
+--- a/include/openvswitch/flow.h
++++ b/include/openvswitch/flow.h
+@@ -198,6 +198,25 @@ struct flow_wildcards {
+     struct flow masks;
+ };
+ 
++/* Classifier iteration states for cmpflow synchronization */
++enum {
++    CMPFLOW_ITERATE_NONE = 0,
++    CMPFLOW_ITERATE_START,
++    CMPFLOW_ITERATE_TABLE,
++    CMPFLOW_ITERATE_FINISH
++};
++
++/* Information for installing computational flows */
++struct cmpflow_iterator {
++    struct flow flow;
++    struct flow_wildcards mask;
++    struct cls_cursor *cursor;
++    size_t unique_id;
++    int priority;
++    int table_id;
++    int iteration_state;
++};
++
+ #define WC_MASK_FIELD(WC, FIELD) \
+     memset(&(WC)->masks.FIELD, 0xff, sizeof (WC)->masks.FIELD)
+ #define WC_MASK_FIELD_MASK(WC, FIELD, MASK)     \
+diff --git a/lib/automake.mk b/lib/automake.mk
+index 95925b57c..a713827cd 100644
+--- a/lib/automake.mk
++++ b/lib/automake.mk
+@@ -155,6 +155,8 @@ lib_libopenvswitch_la_SOURCES = \
+ 	lib/netlink.c \
+ 	lib/netlink.h \
+ 	lib/netnsid.h \
++    lib/dpif-netdev-nmu.h \
++    lib/dpif-netdev-nmu.c \
+ 	lib/nx-match.c \
+ 	lib/nx-match.h \
+ 	lib/object-collection.c \
+diff --git a/lib/classifier-private.h b/lib/classifier-private.h
+index 1d5ee007a..a5e77ab4a 100644
+--- a/lib/classifier-private.h
++++ b/lib/classifier-private.h
+@@ -72,6 +72,9 @@ struct cls_match {
+     /* Accessed by all readers. */
+     struct cmap_node cmap_node; /* Within struct cls_subtable 'rules'. */
+ 
++    /* Used for identifying cmpflows */
++    uint64_t unique_id;
++
+     /* Rule versioning. */
+     struct versions versions;
+ 
+diff --git a/lib/classifier.c b/lib/classifier.c
+index f2c3497c2..b679afe38 100644
+--- a/lib/classifier.c
++++ b/lib/classifier.c
+@@ -22,6 +22,7 @@
+ #include <netinet/in.h>
+ #include "byte-order.h"
+ #include "openvswitch/dynamic-string.h"
++#include "ovs-atomic.h"
+ #include "odp-util.h"
+ #include "packets.h"
+ #include "util.h"
+@@ -102,6 +103,10 @@ cls_match_alloc(const struct cls_rule *rule, ovs_version_t version,
+     ovsrcu_set_hidden(&cls_match->conj_set,
+                       cls_conjunction_set_alloc(cls_match, conj, n));
+ 
++    /* Install a unique ID per match */
++    static uint64_t unique_id = 0;
++    atomic_add_relaxed(&unique_id, 1ul, &cls_match->unique_id);
++
+     return cls_match;
+ }
+ 
+@@ -937,7 +942,8 @@ free_conjunctive_matches(struct hmap *matches,
+ static const struct cls_rule *
+ classifier_lookup__(const struct classifier *cls, ovs_version_t version,
+                     struct flow *flow, struct flow_wildcards *wc,
+-                    bool allow_conjunctive_matches)
++                    bool allow_conjunctive_matches,
++                    struct cmpflow_iterator *it)
+ {
+     struct trie_ctx trie_ctx[CLS_MAX_TRIES];
+     const struct cls_match *match;
+@@ -1016,6 +1022,9 @@ classifier_lookup__(const struct classifier *cls, ovs_version_t version,
+         if (soft != soft_stub) {
+             free(soft);
+         }
++        if (hard && it) {
++            cls_rule_set_cmpflow_iterator(hard->cls_rule, it);
++        }
+         return hard ? hard->cls_rule : NULL;
+     }
+ 
+@@ -1097,7 +1106,7 @@ classifier_lookup__(const struct classifier *cls, ovs_version_t version,
+                 const struct cls_rule *rule;
+ 
+                 flow->conj_id = id;
+-                rule = classifier_lookup__(cls, version, flow, wc, false);
++                rule = classifier_lookup__(cls, version, flow, wc, false, it);
+                 flow->conj_id = saved_conj_id;
+ 
+                 if (rule) {
+@@ -1147,9 +1156,30 @@ classifier_lookup__(const struct classifier *cls, ovs_version_t version,
+     if (soft != soft_stub) {
+         free(soft);
+     }
++    if (hard && it) {
++        cls_rule_set_cmpflow_iterator(hard->cls_rule, it);
++    }
+     return hard ? hard->cls_rule : NULL;
+ }
+ 
++/* Updates the computational flow iterator "it" with the properties of "rule.
++ * Returns "true" on success */
++bool
++cls_rule_set_cmpflow_iterator(const struct cls_rule *rule,
++                              struct cmpflow_iterator *it)
++{
++    struct cls_match *match;
++    match = ovsrcu_get(struct cls_match *, &rule->cls_match);
++    if (!match) {
++        return false;
++    }
++    it->priority = rule->priority;
++    it->unique_id = match->unique_id;
++    miniflow_expand(rule->match.flow, &it->flow);
++    minimask_expand(rule->match.mask, &it->mask);
++    return true;
++}
++
+ /* Finds and returns the highest-priority rule in 'cls' that matches 'flow' and
+  * that is visible in 'version'.  Returns a null pointer if no rules in 'cls'
+  * match 'flow'.  If multiple rules of equal priority match 'flow', returns one
+@@ -1166,7 +1196,17 @@ const struct cls_rule *
+ classifier_lookup(const struct classifier *cls, ovs_version_t version,
+                   struct flow *flow, struct flow_wildcards *wc)
+ {
+-    return classifier_lookup__(cls, version, flow, wc, true);
++    return classifier_lookup__(cls, version, flow, wc, true, NULL);
++}
++
++const struct cls_rule *
++classifier_lookup_cmpflow(const struct classifier *cls,
++                          ovs_version_t version,
++                          struct flow *flow,
++                          struct flow_wildcards *wc,
++                          struct cmpflow_iterator *it)
++{
++    return classifier_lookup__(cls, version, flow, wc, true, it);
+ }
+ 
+ /* Finds and returns a rule in 'cls' with exactly the same priority and
+diff --git a/lib/classifier.h b/lib/classifier.h
+index f646a8f74..04423eb31 100644
+--- a/lib/classifier.h
++++ b/lib/classifier.h
+@@ -399,6 +399,11 @@ static inline void classifier_publish(struct classifier *);
+ const struct cls_rule *classifier_lookup(const struct classifier *,
+                                          ovs_version_t, struct flow *,
+                                          struct flow_wildcards *);
++const struct cls_rule *classifier_lookup_cmpflow(const struct classifier *cls,
++                                                 ovs_version_t version,
++                                                 struct flow *flow,
++                                                 struct flow_wildcards *wc,
++                                                 struct cmpflow_iterator *it);
+ bool classifier_rule_overlaps(const struct classifier *,
+                               const struct cls_rule *, ovs_version_t);
+ const struct cls_rule *classifier_find_rule_exactly(const struct classifier *,
+@@ -424,6 +429,8 @@ bool cls_rule_is_catchall(const struct cls_rule *);
+ bool cls_rule_is_loose_match(const struct cls_rule *rule,
+                              const struct minimatch *criteria);
+ bool cls_rule_visible_in_version(const struct cls_rule *, ovs_version_t);
++bool cls_rule_set_cmpflow_iterator(const struct cls_rule *rule,
++                                   struct cmpflow_iterator *it);
+ 
+ /* Iteration.
+  *
+diff --git a/lib/dpif-netdev-perf.c b/lib/dpif-netdev-perf.c
+index 9560e7c3c..2cca4546c 100644
+--- a/lib/dpif-netdev-perf.c
++++ b/lib/dpif-netdev-perf.c
+@@ -206,6 +206,14 @@ pmd_perf_stats_init(struct pmd_perf_stats *s)
+     s->log_reason = NULL;
+ }
+ 
++void
++pmd_perf_stats_clear_extended(struct pmd_perf_stats *s)
++{
++    for (int i = PMD_TIME_DFC; i < PMD_N_STATS; i++) {
++        atomic_read_relaxed(&s->counters.n[i], &s->counters.zero[i]);
++    }
++}
++
+ void
+ pmd_perf_format_overall_stats(struct ds *str, struct pmd_perf_stats *s,
+                               double duration)
+diff --git a/lib/dpif-netdev-perf.h b/lib/dpif-netdev-perf.h
+index 72645b6b3..fe383c251 100644
+--- a/lib/dpif-netdev-perf.h
++++ b/lib/dpif-netdev-perf.h
+@@ -35,6 +35,23 @@
+ #include "unixctl.h"
+ #include "util.h"
+ 
++/* Start measuring time (nano-secs) to an existing variable "name" */
++#define PERF_FILL(name)                       \
++    struct timespec name##_start, name##_end; \
++    clock_gettime(CLOCK_MONOTONIC, &name##_start);
++
++/* Start measuring time (nano-secs) to new variable "name" */
++#define PERF_START(name)                      \
++    struct timespec name##_start, name##_end; \
++    size_t name;                              \
++    clock_gettime(CLOCK_MONOTONIC, &name##_start);
++
++/* Stop measuring time, store results to variable double "name" */
++#define PERF_END(name)                                         \
++    clock_gettime(CLOCK_MONOTONIC, &name##_end);               \
++    name=-(name##_start.tv_sec * 1e9 + name##_start.tv_nsec)   \
++         +(name##_end.tv_sec * 1e9 + name##_end.tv_nsec);
++
+ #ifdef  __cplusplus
+ extern "C" {
+ #endif
+@@ -77,7 +94,18 @@ enum pmd_stat_type {
+     PMD_CYCLES_ITER_IDLE,   /* Cycles spent in idle iterations. */
+     PMD_CYCLES_ITER_BUSY,   /* Cycles spent in busy iterations. */
+     PMD_CYCLES_UPCALL,      /* Cycles spent processing upcalls. */
+-    PMD_N_STATS
++    /* Used for measuring PMD extended statistics */
++    PMD_TIME_DFC,
++    PMD_TIME_FAST_PATH,
++    PMD_TIME_DPCLS,
++    PMD_TIME_FLOW_LOOKUP,
++    PMD_TIME_UPCALL,
++    PMD_TIME_EXECUTE,
++    PMD_DELTA_INSERTIONS,
++    PMD_DELTA_DELETIONS,
++    PMD_DELTA_UPCALLS,
++    PMD_DELTA_PACKETS,
++    PMD_N_STATS,
+ };
+ 
+ /* Array of PMD counters indexed by enum pmd_stat_type.
+@@ -427,7 +455,7 @@ void pmd_perf_format_ms_history(struct ds *str, struct pmd_perf_stats *s,
+ void pmd_perf_log_set_cmd(struct unixctl_conn *conn,
+                           int argc, const char *argv[],
+                           void *aux OVS_UNUSED);
+-
++void pmd_perf_stats_clear_extended(struct pmd_perf_stats *s);
+ #ifdef  __cplusplus
+ }
+ #endif
+diff --git a/lib/dpif-netdev-private.h b/lib/dpif-netdev-private.h
+index 68c33a0f9..ce7ce8606 100644
+--- a/lib/dpif-netdev-private.h
++++ b/lib/dpif-netdev-private.h
+@@ -23,14 +23,27 @@
+ 
+ #include "dpif.h"
+ #include "cmap.h"
++#include "openvswitch/thread.h"
++#include "openvswitch/types.h"
++#include "pvector.h"
+ 
+ #ifdef  __cplusplus
+ extern "C" {
+ #endif
+ 
++struct dpcls {
++    struct cmap_node node;      /* Within dp_netdev_pmd_thread.classifiers */
++    odp_port_t in_port;
++    struct cmap subtables_map;
++    struct pvector subtables;
++};
++
+ /* Forward declaration for lookup_func typedef. */
+ struct dpcls_subtable;
+ struct dpcls_rule;
++struct dp_netdev_pmd_thread;
++
++extern struct odp_support dp_netdev_support;
+ 
+ /* Must be public as it is instantiated in subtable struct below. */
+ struct netdev_flow_key {
+@@ -42,12 +55,37 @@ struct netdev_flow_key {
+ 
+ /* A rule to be inserted to the classifier. */
+ struct dpcls_rule {
++    struct cmpflow *cmpflow; /* Pointer to the relevant cmpflow */
++    uint64_t nmu_version;    /* Which NMU version holds this */
++    bool in_nmu;             /* Is this held by NMU library? */
++    bool is_cmpflow;              /* False iff this is a megaflow */
+     struct cmap_node cmap_node;   /* Within struct dpcls_subtable 'rules'. */
+     struct netdev_flow_key *mask; /* Subtable's mask. */
+     struct netdev_flow_key flow;  /* Matching key. */
+     /* 'flow' must be the last field, additional space is allocated here. */
+ };
+ 
++/* A data-path computational flow. Computational flows can also represet
++ * "regular" non-overlapping megaflows without priorities. */
++struct cmpflow {
++    struct netdev_flow_key *flow; /* Used by NMU iSet match */
++    struct netdev_flow_key *mask; /* Used by NMU iSet match */
++    const uint64_t *mf_values;    /* Packed values for flow */
++    uint64_t *mf_masks;           /* Packed values for mask */
++    uint64_t unique_id;           /* Unique ID of this */
++    int priority;                 /* Only has meaning if this is not megaflow */
++    uint8_t mf_bits_set_unit0;    /* Used by NMU validation */
++    uint8_t mf_bits_set_unit1;    /* Used by NMU validation */
++};
++
++/* dp_netdev_flow and methods are defined in dpif-netdev.c */
++struct dp_netdev_flow;
++
++void dp_netdev_flow_unref(struct dp_netdev_flow *);
++bool dp_netdev_flow_ref(struct dp_netdev_flow *);
++struct dp_netdev_flow * dp_netdev_flow_cast(const struct dpcls_rule *cr);
++
++
+ /* Lookup function for a subtable in the dpcls. This function is called
+  * by each subtable with an array of packets, and a bitmask of packets to
+  * perform the lookup on. Using a function pointer gives flexibility to
+@@ -80,6 +118,9 @@ struct dpcls_subtable {
+     /* The fields are only used by writers. */
+     struct cmap_node cmap_node OVS_GUARDED; /* Within dpcls 'subtables_map'. */
+ 
++    /* Lock on "cmap_rules" */
++    struct ovs_spin cmap_rules_lock;
++
+     /* These fields are accessed by readers. */
+     struct cmap rules;           /* Contains "struct dpcls_rule"s. */
+     uint32_t hit_cnt;            /* Number of match hits in subtable in current
+@@ -92,6 +133,9 @@ struct dpcls_subtable {
+     uint8_t mf_bits_set_unit0;
+     uint8_t mf_bits_set_unit1;
+ 
++    /* How many rules are linked to this subtable */
++    struct ovs_refcount ref_cnt;
++
+     /* The lookup function to use for this subtable. If there is a known
+      * property of the subtable (eg: only 3 bits of miniflow metadata is
+      * used for the lookup) then this can point at an optimized version of
+@@ -105,6 +149,57 @@ struct dpcls_subtable {
+     /* 'mask' must be the last field, additional space is allocated here. */
+ };
+ 
++/* These support rule migration from dpcls to NMU */
++void dpcls_subtable_destroy_cb(struct dpcls_subtable *);
++bool dpcls_subtable_ref(struct dpcls_subtable *);
++void dpcls_subtable_unref(struct dpcls *cls, struct dpcls_subtable *);
++void dpcls_subtable_publish(struct dpcls *cls,
++                            struct dpcls_subtable *);
++void dpcls_subtable_unpublish(struct dpcls *cls,
++                              struct dpcls_subtable *subtable);
++
++/* Used both in dpif-netdev.c and dpif-netdev-nmu.c */
++void dpcls_insert(struct dpcls *, struct dpcls_rule *,
++                         const struct netdev_flow_key *mask);
++void dpcls_remove(struct dpcls *, struct dpcls_rule *);
++
++void netdev_flow_mask_init_explicit(struct netdev_flow_key *mask,
++                                    const struct flow *flow,
++                                    const struct flow_wildcards *wc);
++void netdev_flow_key_init_masked(struct netdev_flow_key *dst,
++                                 const struct flow *flow,
++                                 const struct netdev_flow_key *mask);
++struct dpcls_rule * dp_netdev_flow_get_rule(struct dp_netdev_flow *);
++bool dp_netdev_flow_is_dead(struct dp_netdev_flow *);
++void dp_netdev_pmd_remove_flow(struct dp_netdev_pmd_thread *pmd,
++                               struct dp_netdev_flow *flow);
++void dp_netdev_pmd_lock(struct dp_netdev_pmd_thread *pmd);
++void dp_netdev_pmd_unlock(struct dp_netdev_pmd_thread *pmd);
++void dp_netdev_pmd_unlock(struct dp_netdev_pmd_thread *pmd);
++long long dp_netdev_pmd_now(struct dp_netdev_pmd_thread *pmd);
++int dp_netdev_pmd_get_port_by_name(struct dp_netdev_pmd_thread *pmd, 
++                                   const char *name,
++                                   odp_port_t *port_no_p);
++
++struct dp_netdev_flow * dp_netdev_flow_add(struct dp_netdev_pmd_thread *pmd,
++                                           struct match *match,
++                                           const ovs_u128 *ufid,
++                                           const struct nlattr *actions,
++                                           size_t actions_len,
++                                           struct cmpflow_iterator *);
++void dp_netdev_flow_used(struct dp_netdev_flow *netdev_flow,
++                         int cnt,
++                         int size,
++                         uint16_t tcp_flags, long long now);
++const struct flow* dp_netdev_flow_get_flow(struct dp_netdev_flow *dp_flow);
++struct dpcls * dp_netdev_pmd_find_flow_dpcls(struct dp_netdev_pmd_thread *pmd,
++                                             struct dp_netdev_flow *flow);
++int dp_netdev_upcall(struct dp_netdev_pmd_thread *pmd, struct dp_packet *packet_,
++                     struct flow *flow, struct flow_wildcards *wc, ovs_u128 *ufid,
++                     enum dpif_upcall_type type, const struct nlattr *userdata,
++                     struct ofpbuf *actions, struct ofpbuf *put_actions,
++                     struct cmpflow_iterator *it);
++
+ /* Iterate through netdev_flow_key TNL u64 values specified by 'FLOWMAP'. */
+ #define NETDEV_FLOW_KEY_FOR_EACH_IN_FLOWMAP(VALUE, KEY, FLOWMAP)   \
+     MINIFLOW_FOR_EACH_IN_FLOWMAP (VALUE, &(KEY)->mf, FLOWMAP)
+diff --git a/lib/dpif-netdev.c b/lib/dpif-netdev.c
+index 42e1c44ae..ab5cc8f2a 100644
+--- a/lib/dpif-netdev.c
++++ b/lib/dpif-netdev.c
+@@ -42,6 +42,7 @@
+ #include "dp-packet.h"
+ #include "dpif.h"
+ #include "dpif-netdev-perf.h"
++#include "dpif-netdev-nmu.h"
+ #include "dpif-provider.h"
+ #include "dummy.h"
+ #include "fat-rwlock.h"
+@@ -97,8 +98,8 @@ DEFINE_STATIC_PER_THREAD_DATA(uint32_t, recirc_depth, 0)
+ #define DEFAULT_TX_FLUSH_INTERVAL 0
+ 
+ /* Configuration parameters. */
+-enum { MAX_FLOWS = 65536 };     /* Maximum number of flows in flow table. */
+-enum { MAX_METERS = 65536 };    /* Maximum number of meters. */
++enum { MAX_FLOWS = 262144 };     /* Maximum number of flows in flow table. */
++enum { MAX_METERS = 262144 };    /* Maximum number of meters. */
+ enum { MAX_BANDS = 8 };         /* Maximum number of bands / meter. */
+ enum { N_METER_LOCKS = 64 };    /* Maximum number of meters. */
+ 
+@@ -127,7 +128,7 @@ static struct vlog_rate_limit upcall_rl = VLOG_RATE_LIMIT_INIT(600, 600);
+                                      | CS_SRC_NAT | CS_DST_NAT)
+ #define DP_NETDEV_CS_UNSUPPORTED_MASK (~(uint32_t)DP_NETDEV_CS_SUPPORTED_MASK)
+ 
+-static struct odp_support dp_netdev_support = {
++struct odp_support dp_netdev_support = {
+     .max_vlan_headers = SIZE_MAX,
+     .max_mpls_depth = SIZE_MAX,
+     .recirc = true,
+@@ -239,13 +240,6 @@ struct dfc_cache {
+  * and used during rxq to pmd assignment. */
+ #define PMD_RXQ_INTERVAL_MAX 6
+ 
+-struct dpcls {
+-    struct cmap_node node;      /* Within dp_netdev_pmd_thread.classifiers */
+-    odp_port_t in_port;
+-    struct cmap subtables_map;
+-    struct pvector subtables;
+-};
+-
+ /* Data structure to keep packet order till fastpath processing. */
+ struct dp_packet_flow_map {
+     struct dp_packet *packet;
+@@ -256,13 +250,12 @@ struct dp_packet_flow_map {
+ static void dpcls_init(struct dpcls *);
+ static void dpcls_destroy(struct dpcls *);
+ static void dpcls_sort_subtable_vector(struct dpcls *);
+-static void dpcls_insert(struct dpcls *, struct dpcls_rule *,
+-                         const struct netdev_flow_key *mask);
+-static void dpcls_remove(struct dpcls *, struct dpcls_rule *);
+-static bool dpcls_lookup(struct dpcls *cls,
++static bool dpcls_lookup(struct dp_netdev_pmd_thread *pmd,
++                         odp_port_t in_port,
+                          const struct netdev_flow_key *keys[],
+                          struct dpcls_rule **rules, size_t cnt,
+-                         int *num_lookups_p);
++                         int *num_lookups_p,
++                         struct nmucls *nmucls, size_t *dpcls_time_p);
+ 
+ /* Set of supported meter flags */
+ #define DP_SUPPORTED_METER_FLAGS_MASK \
+@@ -339,6 +332,12 @@ struct dp_netdev {
+     /* Enable the SMC cache from ovsdb config */
+     atomic_bool smc_enable_db;
+ 
++    /* NuevoMatchUp configuration from ovsdb config */
++    struct nmu_config *nmu_config;
++
++    /* Interval in ms between each print */
++    double log_interval_ms;
++
+     /* Protects access to ofproto-dpif-upcall interface during revalidator
+      * thread synchronization. */
+     struct fat_rwlock upcall_rwlock;
+@@ -567,8 +566,6 @@ struct dp_netdev_flow {
+     /* 'cr' must be the last member. */
+ };
+ 
+-static void dp_netdev_flow_unref(struct dp_netdev_flow *);
+-static bool dp_netdev_flow_ref(struct dp_netdev_flow *);
+ static int dpif_netdev_flow_from_nlattrs(const struct nlattr *, uint32_t,
+                                          struct flow *, bool);
+ 
+@@ -688,6 +685,11 @@ struct dp_netdev_pmd_thread {
+     struct seq *reload_seq;
+     uint64_t last_reload_seq;
+ 
++    struct nmucls *nmucls;
++
++    /* Used for PMD extended statistics */
++    long long int log_timestamp;
++
+     /* These are atomic variables used as a synchronization and configuration
+      * points for thread reload/exit.
+      *
+@@ -1017,6 +1019,42 @@ format_pmd_thread(struct ds *reply, struct dp_netdev_pmd_thread *pmd)
+     ds_put_cstr(reply, ":\n");
+ }
+ 
++/* Print the PMD's extended statistics for the preconfigured interval in ms */
++static void
++pmd_info_extended_stats(struct dp_netdev_pmd_thread *pmd)
++{
++    uint64_t stats[PMD_N_STATS];
++    long long int elapsed;
++
++    elapsed = time_msec() - pmd->log_timestamp;
++    if (elapsed < pmd->dp->log_interval_ms) {
++        return;
++    }
++    pmd->log_timestamp = time_msec();
++
++    pmd_perf_read_counters(&pmd->perf_stats, stats);
++
++    VLOG_INFO("Extended stats: insertions: %lu deletions: %lu "
++              "total-flows: %lu packets: %lu "
++              "upcalls: %lu upcall-avg-us: %.2lf "
++              "dfc-us: %.2lf fastpath-us: %.2lf execute-us: %.2lf "
++              "dpcls-us: %.2lf lookup-us: %.2lf ",
++              stats[PMD_DELTA_INSERTIONS],
++              stats[PMD_DELTA_DELETIONS],
++              cmap_count(&pmd->flow_table),
++              stats[PMD_DELTA_PACKETS],
++              stats[PMD_DELTA_UPCALLS],
++              stats[PMD_TIME_UPCALL] / (double) stats[PMD_DELTA_UPCALLS]
++                                     / 1000.0,
++              stats[PMD_TIME_DFC] / 1000.0,
++              stats[PMD_TIME_FAST_PATH] / 1000.0,
++              stats[PMD_TIME_EXECUTE] / 1000.0,
++              stats[PMD_TIME_DPCLS] / 1000.0,
++              stats[PMD_TIME_FLOW_LOOKUP] / 1000.0);
++
++    pmd_perf_stats_clear_extended(&pmd->perf_stats);
++}
++
+ static void
+ pmd_info_show_stats(struct ds *reply,
+                     struct dp_netdev_pmd_thread *pmd)
+@@ -1065,6 +1103,8 @@ pmd_info_show_stats(struct ds *reply,
+                   stats[PMD_STAT_MISS], stats[PMD_STAT_LOST],
+                   packets_per_batch);
+ 
++    nmucls_print_stats(reply, pmd->nmucls);
++
+     if (total_cycles == 0) {
+         return;
+     }
+@@ -1605,6 +1645,8 @@ create_dp_netdev(const char *name, const struct dpif_class *class,
+         return error;
+     }
+ 
++    dp->nmu_config = nmu_config_init();
++
+     dp->last_tnl_conf_seq = seq_read(tnl_conf_seq);
+     *dpp = dp;
+     return 0;
+@@ -1716,6 +1758,8 @@ dp_netdev_free(struct dp_netdev *dp)
+         ovs_mutex_destroy(&dp->meter_locks[i]);
+     }
+ 
++    nmu_config_destroy(dp->nmu_config);
++
+     free(dp->pmd_cmask);
+     free(CONST_CAST(char *, dp->name));
+     free(dp);
+@@ -2112,7 +2156,7 @@ dp_netdev_flow_free(struct dp_netdev_flow *flow)
+     free(flow);
+ }
+ 
+-static void dp_netdev_flow_unref(struct dp_netdev_flow *flow)
++void dp_netdev_flow_unref(struct dp_netdev_flow *flow)
+ {
+     if (ovs_refcount_unref_relaxed(&flow->ref_cnt) == 1) {
+         ovsrcu_postpone(dp_netdev_flow_free, flow);
+@@ -2159,6 +2203,14 @@ dp_netdev_pmd_find_dpcls(struct dp_netdev_pmd_thread *pmd,
+     return cls;
+ }
+ 
++struct dpcls *
++dp_netdev_pmd_find_flow_dpcls(struct dp_netdev_pmd_thread *pmd,
++                              struct dp_netdev_flow *flow)
++{
++    return dp_netdev_pmd_find_dpcls(pmd, flow->flow.in_port.odp_port);
++
++}
++
+ #define MAX_FLOW_MARK       (UINT32_MAX - 1)
+ #define INVALID_FLOW_MARK   0
+ /* Zero flow mark is used to indicate the HW to remove the mark. A packet
+@@ -2591,24 +2643,36 @@ queue_netdev_flow_put(struct dp_netdev_pmd_thread *pmd,
+     dp_netdev_append_flow_offload(offload);
+ }
+ 
+-static void
++void
+ dp_netdev_pmd_remove_flow(struct dp_netdev_pmd_thread *pmd,
+                           struct dp_netdev_flow *flow)
+     OVS_REQUIRES(pmd->flow_mutex)
+ {
+     struct cmap_node *node = CONST_CAST(struct cmap_node *, &flow->node);
+     struct dpcls *cls;
++    bool flow_in_nmu;
++
+     odp_port_t in_port = flow->flow.in_port.odp_port;
+ 
+     cls = dp_netdev_pmd_lookup_dpcls(pmd, in_port);
+-    ovs_assert(cls != NULL);
+-    dpcls_remove(cls, &flow->cr);
++
++    nmucls_rule_lock(pmd->nmucls, &flow->cr);
++    pmd_perf_update_counter(&pmd->perf_stats, PMD_DELTA_DELETIONS, 1);
++    flow_in_nmu = nmucls_remove(pmd->nmucls, cls, flow);
++
++    if (!flow_in_nmu && !nmucls_rule_is_cmpflow(&flow->cr)) {
++        ovs_assert(cls != NULL);
++        dpcls_remove(cls, &flow->cr);
++    }
++
+     cmap_remove(&pmd->flow_table, node, dp_netdev_flow_hash(&flow->ufid));
+     if (flow->mark != INVALID_FLOW_MARK) {
+         queue_netdev_flow_del(pmd, flow);
+     }
+     flow->dead = true;
+ 
++    nmucls_rule_unlock(pmd->nmucls, &flow->cr);
++
+     dp_netdev_flow_unref(flow);
+ }
+ 
+@@ -2715,13 +2779,13 @@ dpif_netdev_port_poll_wait(const struct dpif *dpif_)
+     seq_wait(dpif->dp->port_seq, dpif->last_port_seq);
+ }
+ 
+-static struct dp_netdev_flow *
++struct dp_netdev_flow *
+ dp_netdev_flow_cast(const struct dpcls_rule *cr)
+ {
+     return cr ? CONTAINER_OF(cr, struct dp_netdev_flow, cr) : NULL;
+ }
+ 
+-static bool dp_netdev_flow_ref(struct dp_netdev_flow *flow)
++bool dp_netdev_flow_ref(struct dp_netdev_flow *flow)
+ {
+     return ovs_refcount_try_ref_rcu(&flow->ref_cnt);
+ }
+@@ -2772,10 +2836,10 @@ netdev_flow_key_clone(struct netdev_flow_key *dst,
+            offsetof(struct netdev_flow_key, mf) + src->len);
+ }
+ 
+-/* Initialize a netdev_flow_key 'mask' from 'match'. */
+-static inline void
+-netdev_flow_mask_init(struct netdev_flow_key *mask,
+-                      const struct match *match)
++void
++netdev_flow_mask_init_explicit(struct netdev_flow_key *mask,
++                               const struct flow *flow,
++                               const struct flow_wildcards *wc)
+ {
+     uint64_t *dst = miniflow_values(&mask->mf);
+     struct flowmap fmap;
+@@ -2783,11 +2847,11 @@ netdev_flow_mask_init(struct netdev_flow_key *mask,
+     size_t idx;
+ 
+     /* Only check masks that make sense for the flow. */
+-    flow_wc_map(&match->flow, &fmap);
++    flow_wc_map(flow, &fmap);
+     flowmap_init(&mask->mf.map);
+ 
+     FLOWMAP_FOR_EACH_INDEX(idx, fmap) {
+-        uint64_t mask_u64 = flow_u64_value(&match->wc.masks, idx);
++        uint64_t mask_u64 = flow_u64_value(&wc->masks, idx);
+ 
+         if (mask_u64) {
+             flowmap_set(&mask->mf.map, idx, 1);
+@@ -2808,8 +2872,16 @@ netdev_flow_mask_init(struct netdev_flow_key *mask,
+     mask->len = netdev_flow_key_size(n);
+ }
+ 
+-/* Initializes 'dst' as a copy of 'flow' masked with 'mask'. */
++/* Initialize a netdev_flow_key 'mask' from 'match'. */
+ static inline void
++netdev_flow_mask_init(struct netdev_flow_key *mask,
++                      const struct match *match)
++{
++    netdev_flow_mask_init_explicit(mask, &match->flow, &match->wc);
++}
++
++/* Initializes 'dst' as a copy of 'flow' masked with 'mask'. */
++void
+ netdev_flow_key_init_masked(struct netdev_flow_key *dst,
+                             const struct flow *flow,
+                             const struct netdev_flow_key *mask)
+@@ -2830,6 +2902,55 @@ netdev_flow_key_init_masked(struct netdev_flow_key *dst,
+                             (dst_u64 - miniflow_get_values(&dst->mf)) * 8);
+ }
+ 
++struct dpcls_rule *
++dp_netdev_flow_get_rule(struct dp_netdev_flow *flow)
++{
++    return &flow->cr;
++}
++
++bool
++dp_netdev_flow_is_dead(struct dp_netdev_flow *flow)
++{
++    return flow->dead;
++}
++
++int
++dp_netdev_pmd_get_port_by_name(struct dp_netdev_pmd_thread *pmd, 
++                               const char *name,
++                               odp_port_t *port_no_p)
++{
++    struct dp_netdev_port *port;
++    if (get_port_by_name(pmd->dp, name, &port)) {
++        return ENODEV;
++    }
++    *port_no_p = port->port_no;
++    return 0;
++}
++
++void
++dp_netdev_pmd_lock(struct dp_netdev_pmd_thread *pmd)
++{
++    ovs_mutex_lock(&pmd->flow_mutex);
++}
++
++void
++dp_netdev_pmd_unlock(struct dp_netdev_pmd_thread *pmd)
++{
++    ovs_mutex_unlock(&pmd->flow_mutex);
++}
++
++const struct flow*
++dp_netdev_flow_get_flow(struct dp_netdev_flow *dp_flow)
++{
++    return &dp_flow->flow;
++}
++
++long long
++dp_netdev_pmd_now(struct dp_netdev_pmd_thread *pmd)
++{
++    return pmd->ctx.now;
++}
++
+ static inline bool
+ emc_entry_alive(struct emc_entry *ce)
+ {
+@@ -3013,17 +3134,20 @@ dp_netdev_pmd_lookup_flow(struct dp_netdev_pmd_thread *pmd,
+                           const struct netdev_flow_key *key,
+                           int *lookup_num_p)
+ {
+-    struct dpcls *cls;
+     struct dpcls_rule *rule;
+     odp_port_t in_port = u32_to_odp(MINIFLOW_GET_U32(&key->mf,
+                                                      in_port.odp_port));
+     struct dp_netdev_flow *netdev_flow = NULL;
++    size_t dpcls_time;
+ 
+-    cls = dp_netdev_pmd_lookup_dpcls(pmd, in_port);
+-    if (OVS_LIKELY(cls)) {
+-        dpcls_lookup(cls, &key, &rule, 1, lookup_num_p);
+-        netdev_flow = dp_netdev_flow_cast(rule);
+-    }
++    PERF_START(flow_lookup);
++    dpcls_lookup(pmd, in_port, &key, &rule, 1, lookup_num_p,
++                 pmd->nmucls, &dpcls_time);
++    netdev_flow = dp_netdev_flow_cast(rule);
++    PERF_END(flow_lookup);
++    pmd_perf_update_counter(&pmd->perf_stats,
++                            PMD_TIME_FLOW_LOOKUP,
++                            flow_lookup - dpcls_time);
+     return netdev_flow;
+ }
+ 
+@@ -3248,6 +3372,7 @@ dp_netdev_flow_to_dpif_flow(const struct dp_netdev *dp,
+     flow->ufid = netdev_flow->ufid;
+     flow->ufid_present = true;
+     flow->pmd_id = netdev_flow->pmd_id;
++    flow->is_cmpflow = nmucls_rule_is_cmpflow(&netdev_flow->cr);
+ 
+     get_dpif_flow_status(dp, netdev_flow, &flow->stats, &flow->attrs);
+     flow->attrs.dp_extra_info = netdev_flow->dp_extra_info;
+@@ -3384,10 +3509,11 @@ dp_netdev_get_mega_ufid(const struct match *match, ovs_u128 *mega_ufid)
+     odp_flow_key_hash(&masked_flow, sizeof masked_flow, mega_ufid);
+ }
+ 
+-static struct dp_netdev_flow *
++struct dp_netdev_flow *
+ dp_netdev_flow_add(struct dp_netdev_pmd_thread *pmd,
+                    struct match *match, const ovs_u128 *ufid,
+-                   const struct nlattr *actions, size_t actions_len)
++                   const struct nlattr *actions, size_t actions_len,
++                   struct cmpflow_iterator *cmpflow_it)
+     OVS_REQUIRES(pmd->flow_mutex)
+ {
+     struct ds extra_info = DS_EMPTY_INITIALIZER;
+@@ -3435,8 +3561,15 @@ dp_netdev_flow_add(struct dp_netdev_pmd_thread *pmd,
+     netdev_flow_key_init_masked(&flow->cr.flow, &match->flow, &mask);
+ 
+     /* Select dpcls for in_port. Relies on in_port to be exact match. */
+-    cls = dp_netdev_pmd_find_dpcls(pmd, in_port);
+-    dpcls_insert(cls, &flow->cr, &mask);
++    if (!nmucls_cmpflow_enabled(pmd->nmucls)) {
++        cls = dp_netdev_pmd_find_dpcls(pmd, in_port);
++        dpcls_insert(cls, &flow->cr, &mask);
++    }
++
++    nmucls_insert(pmd->nmucls, &match->flow,
++                  &match->wc, &flow->cr, cmpflow_it);
++
++    pmd_perf_update_counter(&pmd->perf_stats, PMD_DELTA_INSERTIONS, 1);
+ 
+     ds_put_cstr(&extra_info, "miniflow_bits(");
+     FLOWMAP_FOR_EACH_UNIT (unit) {
+@@ -3447,6 +3580,7 @@ dp_netdev_flow_add(struct dp_netdev_pmd_thread *pmd,
+                       count_1bits(flow->cr.mask->mf.map.bits[unit]));
+     }
+     ds_put_char(&extra_info, ')');
++    ds_put_cstr(&extra_info, flow->cr.is_cmpflow ? " cmpflow" : " megaflow");
+     flow->dp_extra_info = ds_steal_cstr(&extra_info);
+     ds_destroy(&extra_info);
+ 
+@@ -3523,7 +3657,7 @@ flow_put_on_pmd(struct dp_netdev_pmd_thread *pmd,
+         if (put->flags & DPIF_FP_CREATE) {
+             if (cmap_count(&pmd->flow_table) < MAX_FLOWS) {
+                 dp_netdev_flow_add(pmd, match, ufid, put->actions,
+-                                   put->actions_len);
++                                   put->actions_len, NULL);
+                 error = 0;
+             } else {
+                 error = EFBIG;
+@@ -3822,15 +3956,20 @@ dpif_netdev_flow_dump_next(struct dpif_flow_dump_thread *thread_,
+ 
+         do {
+             for (n_flows = 0; n_flows < flow_limit; n_flows++) {
++                struct dp_netdev_flow *dp_flow;
+                 struct cmap_node *node;
+ 
+                 node = cmap_next_position(&pmd->flow_table, &dump->flow_pos);
+                 if (!node) {
+                     break;
+                 }
+-                netdev_flows[n_flows] = CONTAINER_OF(node,
+-                                                     struct dp_netdev_flow,
+-                                                     node);
++                dp_flow = CONTAINER_OF(node, struct dp_netdev_flow, node);
++                /* Cmpflows are not managed by revalidator threads */
++                if (nmucls_rule_is_cmpflow(&dp_flow->cr)) {
++                    n_flows--;
++                    continue;
++                }
++                netdev_flows[n_flows] = dp_flow;
+             }
+             /* When finishing dumping the current pmd thread, moves to
+              * the next. */
+@@ -4086,6 +4225,17 @@ dpif_netdev_set_config(struct dpif *dpif, const struct smap *other_config)
+         }
+     }
+ 
++    int nmu_state_changed = nmu_config_read(dp->nmu_config, other_config);
++    if (nmu_state_changed) {
++         dp_netdev_request_reconfigure(dp);
++    }
++
++    dp->log_interval_ms = smap_get_int(other_config,
++                                       "log-interval-ms",
++                                       1e3);
++    VLOG_INFO("Log interval: %.0lf ms", dp->log_interval_ms);
++
++
+     bool pmd_rxq_assign_cyc = !strcmp(pmd_rxq_assign, "cycles");
+     if (!pmd_rxq_assign_cyc && strcmp(pmd_rxq_assign, "roundrobin")) {
+         VLOG_WARN("Unsupported Rxq to PMD assignment mode in pmd-rxq-assign. "
+@@ -4950,8 +5100,8 @@ reconfigure_pmd_threads(struct dp_netdev *dp)
+             ds_put_format(&name, "pmd-c%02d/id:", core->core_id);
+             pmd->thread = ovs_thread_create(ds_cstr(&name),
+                                             pmd_thread_main, pmd);
+-            ds_destroy(&name);
+ 
++            ds_destroy(&name);
+             VLOG_INFO("PMD thread on numa_id: %d, core id: %2d created.",
+                       pmd->numa_id, pmd->core_id);
+             changed = true;
+@@ -6230,6 +6380,9 @@ dp_netdev_configure_pmd(struct dp_netdev_pmd_thread *pmd, struct dp_netdev *dp,
+     pmd_perf_stats_init(&pmd->perf_stats);
+     cmap_insert(&dp->poll_threads, CONST_CAST(struct cmap_node *, &pmd->node),
+                 hash_int(core_id, 0));
++
++    pmd->nmucls = nmucls_init(dp->nmu_config, pmd);
++    pmd->log_timestamp = 0;
+ }
+ 
+ static void
+@@ -6237,6 +6390,7 @@ dp_netdev_destroy_pmd(struct dp_netdev_pmd_thread *pmd)
+ {
+     struct dpcls *cls;
+ 
++    nmucls_destroy(pmd->nmucls);
+     dp_netdev_pmd_flow_flush(pmd);
+     hmap_destroy(&pmd->send_port_cache);
+     hmap_destroy(&pmd->tnl_port_cache);
+@@ -6412,7 +6566,7 @@ dpif_netdev_get_datapath_version(void)
+      return xstrdup("<built-in>");
+ }
+ 
+-static void
++void
+ dp_netdev_flow_used(struct dp_netdev_flow *netdev_flow, int cnt, int size,
+                     uint16_t tcp_flags, long long now)
+ {
+@@ -6426,13 +6580,15 @@ dp_netdev_flow_used(struct dp_netdev_flow *netdev_flow, int cnt, int size,
+     atomic_store_relaxed(&netdev_flow->stats.tcp_flags, flags);
+ }
+ 
+-static int
++int
+ dp_netdev_upcall(struct dp_netdev_pmd_thread *pmd, struct dp_packet *packet_,
+                  struct flow *flow, struct flow_wildcards *wc, ovs_u128 *ufid,
+                  enum dpif_upcall_type type, const struct nlattr *userdata,
+-                 struct ofpbuf *actions, struct ofpbuf *put_actions)
++                 struct ofpbuf *actions, struct ofpbuf *put_actions,
++                 struct cmpflow_iterator *it)
+ {
+     struct dp_netdev *dp = pmd->dp;
++    int retval;
+ 
+     if (OVS_UNLIKELY(!dp->upcall_cb)) {
+         return ENODEV;
+@@ -6463,8 +6619,12 @@ dp_netdev_upcall(struct dp_netdev_pmd_thread *pmd, struct dp_packet *packet_,
+         ds_destroy(&ds);
+     }
+ 
+-    return dp->upcall_cb(packet_, flow, ufid, pmd->core_id, type, userdata,
+-                         actions, wc, put_actions, dp->upcall_aux);
++    PERF_START(upcall_time);
++    retval = dp->upcall_cb(packet_, flow, ufid, pmd->core_id, type, userdata,
++                           actions, wc, put_actions, dp->upcall_aux, it);
++    PERF_END(upcall_time);
++    pmd_perf_update_counter(&pmd->perf_stats, PMD_TIME_UPCALL, upcall_time);
++    return retval;
+ }
+ 
+ static inline uint32_t
+@@ -6697,6 +6857,7 @@ dfc_processing(struct dp_netdev_pmd_thread *pmd,
+     pmd_perf_update_counter(&pmd->perf_stats,
+                             md_is_valid ? PMD_STAT_RECIRC : PMD_STAT_RECV,
+                             cnt);
++    pmd_perf_update_counter(&pmd->perf_stats, PMD_DELTA_PACKETS, cnt);
+ 
+     DP_PACKET_BATCH_REFILL_FOR_EACH (i, cnt, packet, packets_) {
+         struct dp_netdev_flow *flow;
+@@ -6805,6 +6966,7 @@ handle_packet_upcall(struct dp_netdev_pmd_thread *pmd,
+                      const struct netdev_flow_key *key,
+                      struct ofpbuf *actions, struct ofpbuf *put_actions)
+ {
++    struct cmpflow_iterator cmpflow_it;
+     struct ofpbuf *add_actions;
+     struct dp_packet_batch b;
+     struct match match;
+@@ -6815,6 +6977,7 @@ handle_packet_upcall(struct dp_netdev_pmd_thread *pmd,
+     match.tun_md.valid = false;
+     miniflow_expand(&key->mf, &match.flow);
+     memset(&match.wc, 0, sizeof match.wc);
++    cmpflow_it.iteration_state = CMPFLOW_ITERATE_NONE;
+ 
+     ofpbuf_clear(actions);
+     ofpbuf_clear(put_actions);
+@@ -6822,8 +6985,14 @@ handle_packet_upcall(struct dp_netdev_pmd_thread *pmd,
+     odp_flow_key_hash(&match.flow, sizeof match.flow, &ufid);
+     error = dp_netdev_upcall(pmd, packet, &match.flow, &match.wc,
+                              &ufid, DPIF_UC_MISS, NULL, actions,
+-                             put_actions);
+-    if (OVS_UNLIKELY(error && error != ENOSPC)) {
++                             put_actions, &cmpflow_it);
++
++    /* Upcall returns BADF when there is ukey installation error */
++    if (OVS_UNLIKELY(error && error == EBADF)) {
++        nmucls_print_rule_with_key(pmd->nmucls, key);
++        /* Any further actions should be taken as if no space left */
++        error = ENOSPC;
++    } else if (OVS_UNLIKELY(error && error != ENOSPC)) {
+         dp_packet_delete(packet);
+         COVERAGE_INC(datapath_drop_upcall_error);
+         return error;
+@@ -6860,7 +7029,8 @@ handle_packet_upcall(struct dp_netdev_pmd_thread *pmd,
+         if (OVS_LIKELY(!netdev_flow)) {
+             netdev_flow = dp_netdev_flow_add(pmd, &match, &ufid,
+                                              add_actions->data,
+-                                             add_actions->size);
++                                             add_actions->size,
++                                             &cmpflow_it);
+         }
+         ovs_mutex_unlock(&pmd->flow_mutex);
+         uint32_t hash = dp_netdev_flow_hash(&netdev_flow->ufid);
+@@ -6894,26 +7064,23 @@ fast_path_processing(struct dp_netdev_pmd_thread *pmd,
+     enum { PKT_ARRAY_SIZE = NETDEV_MAX_BURST };
+ #endif
+     struct dp_packet *packet;
+-    struct dpcls *cls;
+     struct dpcls_rule *rules[PKT_ARRAY_SIZE];
+     struct dp_netdev *dp = pmd->dp;
+     int upcall_ok_cnt = 0, upcall_fail_cnt = 0;
+     int lookup_cnt = 0, add_lookup_cnt;
+     bool any_miss;
++    size_t dpcls_time = 0;
+ 
+     for (size_t i = 0; i < cnt; i++) {
+         /* Key length is needed in all the cases, hash computed on demand. */
+         keys[i]->len = netdev_flow_key_size(miniflow_n_values(&keys[i]->mf));
+     }
+     /* Get the classifier for the in_port */
+-    cls = dp_netdev_pmd_lookup_dpcls(pmd, in_port);
+-    if (OVS_LIKELY(cls)) {
+-        any_miss = !dpcls_lookup(cls, (const struct netdev_flow_key **)keys,
+-                                rules, cnt, &lookup_cnt);
+-    } else {
+-        any_miss = true;
+-        memset(rules, 0, sizeof(rules));
+-    }
++    any_miss = !dpcls_lookup(pmd, in_port,
++                             (const struct netdev_flow_key **)keys,
++                             rules, cnt, &lookup_cnt,
++                             pmd->nmucls, &dpcls_time);
++
+     if (OVS_UNLIKELY(any_miss) && !fat_rwlock_tryrdlock(&dp->upcall_rwlock)) {
+         uint64_t actions_stub[512 / 8], slow_stub[512 / 8];
+         struct ofpbuf actions, put_actions;
+@@ -6993,6 +7160,10 @@ fast_path_processing(struct dp_netdev_pmd_thread *pmd,
+                             upcall_ok_cnt);
+     pmd_perf_update_counter(&pmd->perf_stats, PMD_STAT_LOST,
+                             upcall_fail_cnt);
++    pmd_perf_update_counter(&pmd->perf_stats, PMD_TIME_DPCLS,
++                            dpcls_time);
++    pmd_perf_update_counter(&pmd->perf_stats, PMD_DELTA_UPCALLS,
++                            upcall_ok_cnt + upcall_fail_cnt);
+ }
+ 
+ /* Packets enter the datapath from a port (or from recirculation) here.
+@@ -7022,8 +7193,12 @@ dp_netdev_input__(struct dp_netdev_pmd_thread *pmd,
+     odp_port_t in_port;
+ 
+     n_batches = 0;
++    PERF_START(dfc_time);
+     dfc_processing(pmd, packets, keys, missed_keys, batches, &n_batches,
+                    flow_map, &n_flows, index_map, md_is_valid, port_no);
++    PERF_END(dfc_time);
++    pmd_perf_update_counter(&pmd->perf_stats, PMD_TIME_DFC, dfc_time);
++    PERF_START(fastpath_time);
+ 
+     if (!dp_packet_batch_is_empty(packets)) {
+         /* Get ingress port from first packet's metadata. */
+@@ -7056,9 +7231,20 @@ dp_netdev_input__(struct dp_netdev_pmd_thread *pmd,
+         batches[i].flow->batch = NULL;
+     }
+ 
++    PERF_END(fastpath_time);
++    pmd_perf_update_counter(&pmd->perf_stats,
++                            PMD_TIME_FAST_PATH,
++                            fastpath_time);
++    PERF_START(execute_time);
++
+     for (i = 0; i < n_batches; i++) {
+         packet_batch_per_flow_execute(&batches[i], pmd);
+     }
++
++    PERF_END(execute_time);
++    pmd_perf_update_counter(&pmd->perf_stats, PMD_TIME_EXECUTE, execute_time);
++
++    pmd_info_extended_stats(pmd);
+ }
+ 
+ static void
+@@ -7219,7 +7405,7 @@ dp_execute_userspace_action(struct dp_netdev_pmd_thread *pmd,
+ 
+     error = dp_netdev_upcall(pmd, packet, flow, NULL, ufid,
+                              DPIF_UC_ACTION, userdata, actions,
+-                             NULL);
++                             NULL, NULL);
+     if (!error || error == ENOSPC) {
+         dp_packet_batch_init_packet(&b, packet);
+         dp_netdev_execute_actions(pmd, &b, should_steal, flow,
+@@ -8017,12 +8203,13 @@ dpif_dummy_register(enum dummy_level level)
+ 
+ /* Datapath Classifier. */
+ 
+-static void
++void
+ dpcls_subtable_destroy_cb(struct dpcls_subtable *subtable)
+ {
+     cmap_destroy(&subtable->rules);
+-    ovsrcu_postpone(free, subtable->mf_masks);
+-    ovsrcu_postpone(free, subtable);
++    ovs_spin_destroy(&subtable->cmap_rules_lock);
++    free(subtable->mf_masks);
++    free(subtable);
+ }
+ 
+ /* Initializes 'cls' as a classifier that initially contains no classification
+@@ -8034,12 +8221,47 @@ dpcls_init(struct dpcls *cls)
+     pvector_init(&cls->subtables);
+ }
+ 
+-static void
+-dpcls_destroy_subtable(struct dpcls *cls, struct dpcls_subtable *subtable)
++bool
++dpcls_subtable_ref(struct dpcls_subtable *subtable)
++{
++    return ovs_refcount_try_ref_rcu(&subtable->ref_cnt);
++}
++
++void
++dpcls_subtable_publish(struct dpcls *cls, struct dpcls_subtable *subtable)
+ {
+-    VLOG_DBG("Destroying subtable %p for in_port %d", subtable, cls->in_port);
++    VLOG_DBG("Publishing %"PRIuSIZE". subtable %p for in_port %d",
++             cmap_count(&cls->subtables_map),
++             subtable,
++             cls->in_port);
++    pvector_insert(&cls->subtables, subtable, 0);
++    pvector_publish(&cls->subtables);
++}
++
++void
++dpcls_subtable_unpublish(struct dpcls *cls, struct dpcls_subtable *subtable)
++{
++    VLOG_DBG("Unpublishing subtable %p for in_port %d",
++             subtable,
++             cls->in_port);
+     pvector_remove(&cls->subtables, subtable);
+-    cmap_remove(&cls->subtables_map, &subtable->cmap_node,
++    pvector_publish(&cls->subtables);
++    /* The subtable will be freed when its ref-counter reaches zero */
++}
++
++void
++dpcls_subtable_unref(struct dpcls *cls, struct dpcls_subtable *subtable)
++{
++    if (!subtable) {
++        return;
++    }
++    if (ovs_refcount_unref_relaxed(&subtable->ref_cnt) != 1) {
++        return;
++    }
++    ovs_assert(cmap_count(&subtable->rules) == 0);
++    dpcls_subtable_unpublish(cls, subtable);
++    cmap_remove(&cls->subtables_map,
++                &subtable->cmap_node,
+                 subtable->mask.hash);
+     ovsrcu_postpone(dpcls_subtable_destroy_cb, subtable);
+ }
+@@ -8055,7 +8277,9 @@ dpcls_destroy(struct dpcls *cls)
+ 
+         CMAP_FOR_EACH (subtable, cmap_node, &cls->subtables_map) {
+             ovs_assert(cmap_count(&subtable->rules) == 0);
+-            dpcls_destroy_subtable(cls, subtable);
++            /* Validate there are not active references to the subtable */
++            ovs_assert(ovs_refcount_read(&subtable->ref_cnt) == 1);
++            dpcls_subtable_unref(cls, subtable);
+         }
+         cmap_destroy(&cls->subtables_map);
+         pvector_destroy(&cls->subtables);
+@@ -8093,11 +8317,10 @@ dpcls_create_subtable(struct dpcls *cls, const struct netdev_flow_key *mask)
+     }
+ 
+     cmap_insert(&cls->subtables_map, &subtable->cmap_node, mask->hash);
+-    /* Add the new subtable at the end of the pvector (with no hits yet) */
+-    pvector_insert(&cls->subtables, subtable, 0);
+-    VLOG_DBG("Creating %"PRIuSIZE". subtable %p for in_port %d",
+-             cmap_count(&cls->subtables_map), subtable, cls->in_port);
+-    pvector_publish(&cls->subtables);
++    ovs_spin_init(&subtable->cmap_rules_lock);
++    ovs_refcount_init(&subtable->ref_cnt);
++    /* Will add the new subtable to the end of the pvector */
++    dpcls_subtable_publish(cls, subtable);
+ 
+     return subtable;
+ }
+@@ -8205,19 +8428,22 @@ dp_netdev_pmd_try_optimize(struct dp_netdev_pmd_thread *pmd,
+ }
+ 
+ /* Insert 'rule' into 'cls'. */
+-static void
++void
+ dpcls_insert(struct dpcls *cls, struct dpcls_rule *rule,
+              const struct netdev_flow_key *mask)
+ {
+     struct dpcls_subtable *subtable = dpcls_find_subtable(cls, mask);
+ 
++    dpcls_subtable_ref(subtable);
+     /* Refer to subtable's mask, also for later removal. */
+     rule->mask = &subtable->mask;
++    ovs_spin_lock(&subtable->cmap_rules_lock);
+     cmap_insert(&subtable->rules, &rule->cmap_node, rule->flow.hash);
++    ovs_spin_unlock(&subtable->cmap_rules_lock);
+ }
+ 
+-/* Removes 'rule' from 'cls', also destructing the 'rule'. */
+-static void
++/* Removes 'rule' from 'cls' */
++void
+ dpcls_remove(struct dpcls *cls, struct dpcls_rule *rule)
+ {
+     struct dpcls_subtable *subtable;
+@@ -8226,12 +8452,12 @@ dpcls_remove(struct dpcls *cls, struct dpcls_rule *rule)
+ 
+     /* Get subtable from reference in rule->mask. */
+     INIT_CONTAINER(subtable, rule->mask, mask);
+-    if (cmap_remove(&subtable->rules, &rule->cmap_node, rule->flow.hash)
+-        == 0) {
+-        /* Delete empty subtable. */
+-        dpcls_destroy_subtable(cls, subtable);
+-        pvector_publish(&cls->subtables);
+-    }
++
++    ovs_spin_lock(&subtable->cmap_rules_lock);
++    cmap_remove(&subtable->rules, &rule->cmap_node, rule->flow.hash);
++    ovs_spin_unlock(&subtable->cmap_rules_lock);
++
++    dpcls_subtable_unref(cls, subtable);
+ }
+ 
+ /* Inner loop for mask generation of a unit, see netdev_flow_key_gen_masks. */
+@@ -8300,9 +8526,12 @@ dpcls_rule_matches_key(const struct dpcls_rule *rule,
+  *
+  * Returns true if all miniflows found a corresponding rule. */
+ static bool
+-dpcls_lookup(struct dpcls *cls, const struct netdev_flow_key *keys[],
++dpcls_lookup(struct dp_netdev_pmd_thread *pmd,
++             odp_port_t in_port,
++             const struct netdev_flow_key *keys[],
+              struct dpcls_rule **rules, const size_t cnt,
+-             int *num_lookups_p)
++             int *num_lookups_p,
++             struct nmucls *nmucls, size_t *dpcls_time_p)
+ {
+     /* The received 'cnt' miniflows are the search-keys that will be processed
+      * to find a matching entry into the available subtables.
+@@ -8319,8 +8548,23 @@ dpcls_lookup(struct dpcls *cls, const struct netdev_flow_key *keys[],
+     memset(rules, 0, cnt * sizeof *rules);
+ 
+     int lookups_match = 0, subtable_pos = 1;
++    size_t dpcls_time = 0;
+     uint32_t found_map;
++    struct dpcls *cls;
++
++    /* Perform NMU lookup */
++    nmucls_lookup(nmucls, keys, &keys_map, cnt, rules);
++    if (!keys_map) {
++        goto after_dpcls;
++    }
++
++    PERF_FILL(dpcls_time);
+ 
++    cls = dp_netdev_pmd_lookup_dpcls(pmd, in_port);
++    if (OVS_UNLIKELY(!cls)) {
++        memset(rules, 0, sizeof(*rules)*cnt);
++        return false;
++    }
+     /* The Datapath classifier - aka dpcls - is composed of subtables.
+      * Subtables are dynamically created as needed when new rules are inserted.
+      * Each subtable collects rules with matches on a specific subset of packet
+@@ -8329,6 +8573,11 @@ dpcls_lookup(struct dpcls *cls, const struct netdev_flow_key *keys[],
+      * search-key, the search for that key can stop because the rules are
+      * non-overlapping. */
+     PVECTOR_FOR_EACH (subtable, &cls->subtables) {
++        /* Skip empty subtables */
++        if (!cmap_count(&subtable->rules)) {
++            continue;
++        }
++
+         /* Call the subtable specific lookup function. */
+         found_map = subtable->lookup_func(subtable, keys_map, keys, rules);
+ 
+@@ -8340,16 +8589,22 @@ dpcls_lookup(struct dpcls *cls, const struct netdev_flow_key *keys[],
+         /* Clear the found rules, and return early if all packets are found. */
+         keys_map &= ~found_map;
+         if (!keys_map) {
+-            if (num_lookups_p) {
+-                *num_lookups_p = lookups_match;
+-            }
+-            return true;
++            goto after_dpcls;
+         }
+         subtable_pos++;
+     }
+ 
++after_dpcls:
++
++    PERF_END(dpcls_time);
++
+     if (num_lookups_p) {
+         *num_lookups_p = lookups_match;
+     }
+-    return false;
++
++    if (dpcls_time_p) {
++        *dpcls_time_p = dpcls_time;
++    }
++
++    return !keys_map;
+ }
+diff --git a/lib/dpif.c b/lib/dpif.c
+index 9d9c716c1..5ef756ca0 100644
+--- a/lib/dpif.c
++++ b/lib/dpif.c
+@@ -1428,6 +1428,7 @@ dpif_upcall_type_to_string(enum dpif_upcall_type type)
+     switch (type) {
+     case DPIF_UC_MISS: return "miss";
+     case DPIF_UC_ACTION: return "action";
++    case DPIF_UC_CMPFLOW_SYNC: return "cmpflow";
+     case DPIF_N_UC_TYPES: default: return "<unknown>";
+     }
+ }
+diff --git a/lib/dpif.h b/lib/dpif.h
+index 4df8f7c8b..66d07f5f4 100644
+--- a/lib/dpif.h
++++ b/lib/dpif.h
+@@ -602,6 +602,7 @@ struct dpif_flow {
+     unsigned pmd_id;              /* Datapath poll mode driver id. */
+     struct dpif_flow_stats stats; /* Flow statistics. */
+     struct dpif_flow_attrs attrs; /* Flow attributes. */
++    bool is_cmpflow;              /* True iff this represents a cmpflow */
+ };
+ int dpif_flow_dump_next(struct dpif_flow_dump_thread *,
+                         struct dpif_flow *flows, int max_flows);
+@@ -791,7 +792,8 @@ void dpif_operate(struct dpif *, struct dpif_op **ops, size_t n_ops,
+ enum dpif_upcall_type {
+     DPIF_UC_MISS,               /* Miss in flow table. */
+     DPIF_UC_ACTION,             /* OVS_ACTION_ATTR_USERSPACE action. */
+-    DPIF_N_UC_TYPES
++    DPIF_N_UC_TYPES,
++    DPIF_UC_CMPFLOW_SYNC
+ };
+ 
+ const char *dpif_upcall_type_to_string(enum dpif_upcall_type);
+@@ -865,7 +867,8 @@ typedef int upcall_callback(const struct dp_packet *packet,
+                             struct ofpbuf *actions,
+                             struct flow_wildcards *wc,
+                             struct ofpbuf *put_actions,
+-                            void *aux);
++                            void *aux,
++                            struct cmpflow_iterator *cmpflow_it);
+ 
+ void dpif_register_upcall_cb(struct dpif *, upcall_callback *, void *aux);
+ 
+diff --git a/m4/openvswitch.m4 b/m4/openvswitch.m4
+index add3aabcc..9fba61c4d 100644
+--- a/m4/openvswitch.m4
++++ b/m4/openvswitch.m4
+@@ -637,3 +637,15 @@ AC_DEFUN([OVS_CHECK_UNWIND],
+    fi
+    AM_CONDITIONAL([HAVE_UNWIND], [test "$HAVE_UNWIND" = yes])
+    AC_SUBST([HAVE_UNWIND])])
++
++dnl Checks for libnuevomatchup
++AC_DEFUN([OVS_CHECK_NUEVOMATCHUP],
++  [AC_CHECK_LIB([nuevomatchup], [lnmu_init],
++   [AC_CHECK_HEADERS([libnuevomatchup.h], [HAVE_NUEVOMATCHUP=yes], [HAVE_NUEVOMATCHUP=no])],
++   [HAVE_NUEVOMATCHUP=no])
++   if test "$HAVE_NUEVOMATCHUP" = yes; then
++     AC_DEFINE([HAVE_NUEVOMATCHUP], [1], [Define to 1 if libnuevomatchup is detected.])
++     LIBS="$LIBS -lnuevomatchup"
++   fi
++   AM_CONDITIONAL([HAVE_NUEVOMATCHUP], [test "$HAVE_NUEVOMATCHUP" = yes])
++   AC_SUBST([HAVE_NUEVOMATCHUP])])
+diff --git a/manpages.mk b/manpages.mk
+index dc201484c..54a3a82ad 100644
+--- a/manpages.mk
++++ b/manpages.mk
+@@ -104,7 +104,6 @@ utilities/bugtool/ovs-bugtool.8: \
+ utilities/bugtool/ovs-bugtool.8.in:
+ lib/ovs.tmac:
+ 
+-
+ utilities/ovs-dpctl-top.8: \
+ 	utilities/ovs-dpctl-top.8.in \
+ 	lib/ovs.tmac
+@@ -155,8 +154,6 @@ lib/common-syn.man:
+ lib/common.man:
+ lib/ovs.tmac:
+ 
+-lib/ovs.tmac:
+-
+ utilities/ovs-testcontroller.8: \
+ 	utilities/ovs-testcontroller.8.in \
+ 	lib/common.man \
+diff --git a/ofproto/ofproto-dpif-upcall.c b/ofproto/ofproto-dpif-upcall.c
+index 3a290e491..31ec13fcc 100644
+--- a/ofproto/ofproto-dpif-upcall.c
++++ b/ofproto/ofproto-dpif-upcall.c
+@@ -188,6 +188,7 @@ struct udpif {
+ enum upcall_type {
+     BAD_UPCALL,                 /* Some kind of bug somewhere. */
+     MISS_UPCALL,                /* A flow miss.  */
++    CMPFLOW_SYNC_UPCALL,        /* Sync cmpflows */
+     SLOW_PATH_UPCALL,           /* Slow path upcall.  */
+     SFLOW_UPCALL,               /* sFlow sample. */
+     FLOW_SAMPLE_UPCALL,         /* Per-flow sampling. */
+@@ -282,6 +283,7 @@ struct udpif_key {
+     bool ufid_present;             /* True if 'ufid' is in datapath. */
+     uint32_t hash;                 /* Pre-computed hash for 'key'. */
+     unsigned pmd_id;               /* Datapath poll mode driver id. */
++    bool is_cmpflow;               /* Is the flow a computational flow */
+ 
+     struct ovs_mutex mutex;                   /* Guards the following. */
+     struct dpif_flow_stats stats OVS_GUARDED; /* Last known stats.*/
+@@ -330,7 +332,8 @@ static struct ovs_list all_udpifs = OVS_LIST_INITIALIZER(&all_udpifs);
+ 
+ static size_t recv_upcalls(struct handler *);
+ static int process_upcall(struct udpif *, struct upcall *,
+-                          struct ofpbuf *odp_actions, struct flow_wildcards *);
++                          struct ofpbuf *odp_actions, struct flow_wildcards *,
++                          struct cmpflow_iterator *cmpflow_it);
+ static void handle_upcalls(struct udpif *, struct upcall *, size_t n_upcalls);
+ static void udpif_stop_threads(struct udpif *);
+ static void udpif_start_threads(struct udpif *, size_t n_handlers,
+@@ -840,7 +843,7 @@ recv_upcalls(struct handler *handler)
+         flow_extract(&dupcall->packet, flow);
+ 
+         error = process_upcall(udpif, upcall,
+-                               &upcall->odp_actions, &upcall->wc);
++                               &upcall->odp_actions, &upcall->wc, NULL);
+         if (error) {
+             goto cleanup;
+         }
+@@ -1022,6 +1025,9 @@ classify_upcall(enum dpif_upcall_type type, const struct nlattr *userdata,
+     case DPIF_UC_MISS:
+         return MISS_UPCALL;
+ 
++    case DPIF_UC_CMPFLOW_SYNC:
++        return CMPFLOW_SYNC_UPCALL;
++
+     case DPIF_N_UC_TYPES:
+     default:
+         VLOG_WARN_RL(&rl, "upcall has unexpected type %"PRIu32, type);
+@@ -1117,7 +1123,8 @@ upcall_receive(struct upcall *upcall, const struct dpif_backer *backer,
+     upcall->type = classify_upcall(type, userdata, &upcall->cookie);
+     if (upcall->type == BAD_UPCALL) {
+         return EAGAIN;
+-    } else if (upcall->type == MISS_UPCALL) {
++    } else if ((upcall->type == MISS_UPCALL) ||
++               (upcall->type == CMPFLOW_SYNC_UPCALL)) {
+         error = xlate_lookup(backer, flow, &upcall->ofproto, &upcall->ipfix,
+                              &upcall->sflow, NULL, &upcall->ofp_in_port);
+         if (error) {
+@@ -1162,7 +1169,8 @@ upcall_receive(struct upcall *upcall, const struct dpif_backer *backer,
+ 
+ static void
+ upcall_xlate(struct udpif *udpif, struct upcall *upcall,
+-             struct ofpbuf *odp_actions, struct flow_wildcards *wc)
++             struct ofpbuf *odp_actions, struct flow_wildcards *wc,
++             struct cmpflow_iterator *cmpflow_it)
+ {
+     struct dpif_flow_stats stats;
+     enum xlate_error xerr;
+@@ -1178,8 +1186,9 @@ upcall_xlate(struct udpif *udpif, struct upcall *upcall,
+                   ofproto_dpif_get_tables_version(upcall->ofproto),
+                   upcall->flow, upcall->ofp_in_port, NULL,
+                   stats.tcp_flags, upcall->packet, wc, odp_actions);
++    xin.cmpflow_it = cmpflow_it;
+ 
+-    if (upcall->type == MISS_UPCALL) {
++    if (upcall->type == MISS_UPCALL || upcall->type == CMPFLOW_SYNC_UPCALL) {
+         xin.resubmit_stats = &stats;
+ 
+         if (xin.frozen_state) {
+@@ -1247,7 +1256,7 @@ upcall_xlate(struct udpif *udpif, struct upcall *upcall,
+     /* This function is also called for slow-pathed flows.  As we are only
+      * going to create new datapath flows for actual datapath misses, there is
+      * no point in creating a ukey otherwise. */
+-    if (upcall->type == MISS_UPCALL) {
++    if (upcall->type == MISS_UPCALL || upcall->type == CMPFLOW_SYNC_UPCALL) {
+         upcall->ukey = ukey_create_from_upcall(upcall, wc);
+     }
+ }
+@@ -1303,7 +1312,8 @@ static int
+ upcall_cb(const struct dp_packet *packet, const struct flow *flow, ovs_u128 *ufid,
+           unsigned pmd_id, enum dpif_upcall_type type,
+           const struct nlattr *userdata, struct ofpbuf *actions,
+-          struct flow_wildcards *wc, struct ofpbuf *put_actions, void *aux)
++          struct flow_wildcards *wc, struct ofpbuf *put_actions, void *aux,
++          struct cmpflow_iterator *cmpflow_it)
+ {
+     struct udpif *udpif = aux;
+     struct upcall upcall;
+@@ -1319,7 +1329,7 @@ upcall_cb(const struct dp_packet *packet, const struct flow *flow, ovs_u128 *ufi
+     }
+ 
+     upcall.fitness = ODP_FIT_PERFECT;
+-    error = process_upcall(udpif, &upcall, actions, wc);
++    error = process_upcall(udpif, &upcall, actions, wc, cmpflow_it);
+     if (error) {
+         goto out;
+     }
+@@ -1341,7 +1351,7 @@ upcall_cb(const struct dp_packet *packet, const struct flow *flow, ovs_u128 *ufi
+     if (upcall.ukey && !ukey_install(udpif, upcall.ukey)) {
+         static struct vlog_rate_limit rll = VLOG_RATE_LIMIT_INIT(1, 1);
+         VLOG_WARN_RL(&rll, "upcall_cb failure: ukey installation fails");
+-        error = ENOSPC;
++        error = EBADF;
+     }
+ out:
+     if (!error) {
+@@ -1397,6 +1407,7 @@ dpif_read_actions(struct udpif *udpif, struct upcall *upcall,
+         break;
+     case BAD_UPCALL:
+     case MISS_UPCALL:
++    case CMPFLOW_SYNC_UPCALL:
+     case SLOW_PATH_UPCALL:
+     case CONTROLLER_UPCALL:
+     default:
+@@ -1408,7 +1419,8 @@ dpif_read_actions(struct udpif *udpif, struct upcall *upcall,
+ 
+ static int
+ process_upcall(struct udpif *udpif, struct upcall *upcall,
+-               struct ofpbuf *odp_actions, struct flow_wildcards *wc)
++               struct ofpbuf *odp_actions, struct flow_wildcards *wc,
++               struct cmpflow_iterator *cmpflow_it)
+ {
+     const struct dp_packet *packet = upcall->packet;
+     const struct flow *flow = upcall->flow;
+@@ -1417,7 +1429,8 @@ process_upcall(struct udpif *udpif, struct upcall *upcall,
+     switch (upcall->type) {
+     case MISS_UPCALL:
+     case SLOW_PATH_UPCALL:
+-        upcall_xlate(udpif, upcall, odp_actions, wc);
++    case CMPFLOW_SYNC_UPCALL:
++        upcall_xlate(udpif, upcall, odp_actions, wc, cmpflow_it);
+         return 0;
+ 
+     case SFLOW_UPCALL:
+@@ -1682,7 +1695,8 @@ ukey_create__(const struct nlattr *key, size_t key_len,
+               bool ufid_present, const ovs_u128 *ufid,
+               const unsigned pmd_id, const struct ofpbuf *actions,
+               uint64_t reval_seq, long long int used,
+-              uint32_t key_recirc_id, struct xlate_out *xout)
++              uint32_t key_recirc_id, struct xlate_out *xout,
++              bool is_cmpflow)
+     OVS_NO_THREAD_SAFETY_ANALYSIS
+ {
+     struct udpif_key *ukey = xmalloc(sizeof *ukey);
+@@ -1697,6 +1711,7 @@ ukey_create__(const struct nlattr *key, size_t key_len,
+     ukey->ufid = *ufid;
+     ukey->pmd_id = pmd_id;
+     ukey->hash = get_ukey_hash(&ukey->ufid, pmd_id);
++    ukey->is_cmpflow = is_cmpflow;
+ 
+     ovsrcu_init(&ukey->actions, NULL);
+     ukey_set_actions(ukey, actions);
+@@ -1758,7 +1773,8 @@ ukey_create_from_upcall(struct upcall *upcall, struct flow_wildcards *wc)
+                          true, upcall->ufid, upcall->pmd_id,
+                          &upcall->put_actions, upcall->reval_seq, 0,
+                          upcall->have_recirc_ref ? upcall->recirc->id : 0,
+-                         &upcall->xout);
++                         &upcall->xout,
++                         upcall->type == CMPFLOW_SYNC_UPCALL);
+ }
+ 
+ static int
+@@ -1810,7 +1826,8 @@ ukey_create_from_dpif_flow(const struct udpif *udpif,
+     *ukey = ukey_create__(flow->key, flow->key_len,
+                           flow->mask, flow->mask_len, flow->ufid_present,
+                           &flow->ufid, flow->pmd_id, &actions,
+-                          reval_seq, flow->stats.used, 0, NULL);
++                          reval_seq, flow->stats.used, 0, NULL,
++                          flow->is_cmpflow);
+ 
+     return 0;
+ }
+@@ -2216,6 +2233,13 @@ revalidate_ukey__(struct udpif *udpif, const struct udpif_key *ukey,
+         goto exit;
+     }
+ 
++    /* Cmpflows are not modified here. NMU library deletes them whenever it
++     * does not encounter a previously installed cmpflow */
++    if (ukey->is_cmpflow) {
++        result = UKEY_KEEP;
++        goto exit;
++    }
++
+     /* Do not modify if any bit is wildcarded by the installed datapath flow,
+      * but not the newly revalidated wildcard mask (wc), i.e., if revalidation
+      * tells that the datapath flow is now too generic and must be narrowed
+@@ -2688,7 +2712,9 @@ revalidate(struct revalidator *revalidator)
+             if (!used) {
+                 used = ukey->created;
+             }
+-            if (kill_them_all || (used && used < now - max_idle)) {
++            /* Cmpflows are deleted by NMU */
++            if ((!f->is_cmpflow) &&
++                (kill_them_all || (used && used < now - max_idle))) {
+                 result = UKEY_DELETE;
+             } else {
+                 result = revalidate_ukey(udpif, ukey, &f->stats, &odp_actions,
+@@ -2788,6 +2814,11 @@ revalidator_sweep__(struct revalidator *revalidator, bool purge)
+             }
+             ovs_mutex_unlock(&ukey->mutex);
+ 
++            /* Cmpflows are removed by NMU and not here */
++            if (ukey->is_cmpflow) {
++                ukey_state = UKEY_VISIBLE;
++            }
++
+             if (ukey_state == UKEY_EVICTED) {
+                 /* The common flow deletion case involves deletion of the flow
+                  * during the dump phase and ukey deletion here. */
+diff --git a/ofproto/ofproto-dpif-xlate.c b/ofproto/ofproto-dpif-xlate.c
+index dd89cb47c..2fe784dbf 100644
+--- a/ofproto/ofproto-dpif-xlate.c
++++ b/ofproto/ofproto-dpif-xlate.c
+@@ -4410,7 +4410,8 @@ xlate_table_action(struct xlate_ctx *ctx, ofp_port_t in_port, uint8_t table_id,
+                                            ctx->xin->resubmit_stats,
+                                            &ctx->table_id, in_port,
+                                            may_packet_in, honor_table_miss,
+-                                           ctx->xin->xcache);
++                                           ctx->xin->xcache,
++                                           NULL);
+         /* Swap back. */
+         if (with_ct_orig) {
+             tuple_swap(&ctx->xin->flow, ctx->wc);
+@@ -7155,6 +7156,7 @@ xlate_in_init(struct xlate_in *xin, struct ofproto_dpif *ofproto,
+     xin->in_packet_out = false;
+     xin->recirc_queue = NULL;
+     xin->xport_uuid = UUID_ZERO;
++    xin->cmpflow_it = NULL;
+ 
+     /* Do recirc lookup. */
+     xin->frozen_state = NULL;
+@@ -7618,10 +7620,21 @@ xlate_actions(struct xlate_in *xin, struct xlate_out *xout)
+     }
+ 
+     if (!xin->ofpacts && !ctx.rule) {
+-        ctx.rule = rule_dpif_lookup_from_table(
+-            ctx.xbridge->ofproto, ctx.xin->tables_version, flow, ctx.wc,
+-            ctx.xin->resubmit_stats, &ctx.table_id,
+-            flow->in_port.ofp_port, true, true, ctx.xin->xcache);
++
++        /* Try to process the cmpflow iterator first */
++        ctx.rule = rule_dpif_process_cmpflow_iterator(ctx.xbridge->ofproto,
++                                                      ctx.xin->tables_version,
++                                                      xin->cmpflow_it);
++
++        /* If the iterator did not succeed, perform regular lookup */
++        if (!ctx.rule) {
++            ctx.rule = rule_dpif_lookup_from_table(
++                ctx.xbridge->ofproto, ctx.xin->tables_version, flow, ctx.wc,
++                ctx.xin->resubmit_stats, &ctx.table_id,
++                flow->in_port.ofp_port, true, true, ctx.xin->xcache,
++                xin->cmpflow_it);
++        }
++
+         if (ctx.xin->resubmit_stats) {
+             rule_dpif_credit_stats(ctx.rule, ctx.xin->resubmit_stats, false);
+         }
+diff --git a/ofproto/ofproto-dpif-xlate.h b/ofproto/ofproto-dpif-xlate.h
+index 3426a27b2..d0118ba18 100644
+--- a/ofproto/ofproto-dpif-xlate.h
++++ b/ofproto/ofproto-dpif-xlate.h
+@@ -164,6 +164,10 @@ struct xlate_in {
+      * recirculation. */
+     struct ovs_list *recirc_queue;
+ 
++    /* Computational flows iterator, used for syncying the data-path with
++     * the control-path rules. May be NULL */
++    struct cmpflow_iterator *cmpflow_it;
++
+     /* UUID of first non-patch port packet was received on.*/
+     struct uuid xport_uuid;
+ };
+diff --git a/ofproto/ofproto-dpif.c b/ofproto/ofproto-dpif.c
+index d3cb39207..eb2dff173 100644
+--- a/ofproto/ofproto-dpif.c
++++ b/ofproto/ofproto-dpif.c
+@@ -53,6 +53,7 @@
+ #include "ofproto-dpif-xlate-cache.h"
+ #include "openvswitch/ofp-actions.h"
+ #include "openvswitch/dynamic-string.h"
++#include "openvswitch/flow.h"
+ #include "openvswitch/meta-flow.h"
+ #include "openvswitch/ofp-print.h"
+ #include "openvswitch/ofpbuf.h"
+@@ -4295,11 +4296,14 @@ ofproto_dpif_get_tables_version(struct ofproto_dpif *ofproto)
+ static struct rule_dpif *
+ rule_dpif_lookup_in_table(struct ofproto_dpif *ofproto, ovs_version_t version,
+                           uint8_t table_id, struct flow *flow,
+-                          struct flow_wildcards *wc)
++                          struct flow_wildcards *wc,
++                          struct cmpflow_iterator *cmpflow_it)
+ {
+     struct classifier *cls = &ofproto->up.tables[table_id].cls;
+-    return rule_dpif_cast(rule_from_cls_rule(classifier_lookup(cls, version,
+-                                                               flow, wc)));
++    return rule_dpif_cast(rule_from_cls_rule(
++                classifier_lookup_cmpflow(cls, version,
++                                          flow, wc,
++                                          cmpflow_it)));
+ }
+ 
+ void
+@@ -4349,7 +4353,8 @@ rule_dpif_lookup_from_table(struct ofproto_dpif *ofproto,
+                             const struct dpif_flow_stats *stats,
+                             uint8_t *table_id, ofp_port_t in_port,
+                             bool may_packet_in, bool honor_table_miss,
+-                            struct xlate_cache *xcache)
++                            struct xlate_cache *xcache,
++                            struct cmpflow_iterator *cmpflow_it)
+ {
+     ovs_be16 old_tp_src = flow->tp_src, old_tp_dst = flow->tp_dst;
+     ofp_port_t old_in_port = flow->in_port.ofp_port;
+@@ -4403,7 +4408,8 @@ rule_dpif_lookup_from_table(struct ofproto_dpif *ofproto,
+          next_id++, next_id += (next_id == TBL_INTERNAL))
+     {
+         *table_id = next_id;
+-        rule = rule_dpif_lookup_in_table(ofproto, version, next_id, flow, wc);
++        rule = rule_dpif_lookup_in_table(ofproto, version, next_id, flow, wc,
++                                         cmpflow_it);
+         if (stats) {
+             struct oftable *tbl = &ofproto->up.tables[next_id];
+             unsigned long orig;
+@@ -4460,6 +4466,69 @@ out:
+     return rule;
+ }
+ 
++struct rule_dpif *
++rule_dpif_process_cmpflow_iterator(struct ofproto_dpif *ofproto,
++                                   ovs_version_t version,
++                                   struct cmpflow_iterator *it)
++{
++    const struct cls_rule *found;
++    struct cls_cursor *cursor;
++    struct classifier *cls;
++    bool new_table;
++
++    if (!it) {
++        return NULL;
++    }
++
++start:
++    new_table = false;
++
++    switch (it->iteration_state) {
++    case CMPFLOW_ITERATE_NONE:
++        return NULL;
++    case CMPFLOW_ITERATE_START:
++        it->iteration_state = CMPFLOW_ITERATE_TABLE;
++        it->table_id = 0;
++        it->cursor = xmalloc(sizeof(struct cls_cursor));
++        new_table = true;
++        break;
++    case CMPFLOW_ITERATE_FINISH:
++        it->iteration_state = CMPFLOW_ITERATE_TABLE;
++        it->table_id++;
++        it->table_id += (it->table_id == TBL_INTERNAL);
++        new_table = true;
++        if (it->table_id >= ofproto->up.n_tables) {
++            it->iteration_state = CMPFLOW_ITERATE_NONE;
++            free(it->cursor);
++            return NULL;
++        }
++        break;
++    case CMPFLOW_ITERATE_TABLE:
++    default:
++        break;
++    }
++
++    cursor = (struct cls_cursor*)it->cursor;
++
++    if (new_table) {
++        cls = &ofproto->up.tables[it->table_id].cls;
++        *cursor = cls_cursor_start(cls, NULL, version);
++    }
++
++    found = cursor->rule;
++    if (!found) {
++        it->iteration_state = CMPFLOW_ITERATE_FINISH;
++        goto start;
++    }
++
++    do {
++        cls_cursor_advance(cursor);
++    } while (cursor->rule &&
++             !cls_rule_set_cmpflow_iterator(cursor->rule, it));
++
++    return rule_dpif_cast(rule_from_cls_rule(found));
++}
++
+ static struct rule_dpif *rule_dpif_cast(const struct rule *rule)
+ {
+     return rule ? CONTAINER_OF(rule, struct rule_dpif, up) : NULL;
+@@ -6474,7 +6543,8 @@ ofproto_dpif_add_internal_flow(struct ofproto_dpif *ofproto,
+ 
+     rule = rule_dpif_lookup_in_table(ofproto,
+                                      ofproto_dpif_get_tables_version(ofproto),
+-                                     TBL_INTERNAL, &match->flow, &match->wc);
++                                     TBL_INTERNAL, &match->flow, &match->wc,
++                                     NULL);
+     if (rule) {
+         *rulep = &rule->up;
+     } else {
+diff --git a/ofproto/ofproto-dpif.h b/ofproto/ofproto-dpif.h
+index c9d5df34b..59c00b74f 100644
+--- a/ofproto/ofproto-dpif.h
++++ b/ofproto/ofproto-dpif.h
+@@ -104,7 +104,13 @@ struct rule_dpif *rule_dpif_lookup_from_table(struct ofproto_dpif *,
+                                               ofp_port_t in_port,
+                                               bool may_packet_in,
+                                               bool honor_table_miss,
+-                                              struct xlate_cache *);
++                                              struct xlate_cache *,
++                                              struct cmpflow_iterator *);
++
++struct rule_dpif *
++rule_dpif_process_cmpflow_iterator(struct ofproto_dpif *ofproto,
++                                   ovs_version_t version,
++                                   struct cmpflow_iterator *it);
+ 
+ void rule_dpif_credit_stats(struct rule_dpif *,
+                             const struct dpif_flow_stats *, bool);
+diff --git a/ofproto/ofproto.h b/ofproto/ofproto.h
+index bac4a1c21..f5dee2ae5 100644
+--- a/ofproto/ofproto.h
++++ b/ofproto/ofproto.h
+@@ -307,7 +307,7 @@ int ofproto_port_dump_done(struct ofproto_port_dump *);
+           : (ofproto_port_dump_done(DUMP), false));         \
+         )
+ 
+-#define OFPROTO_FLOW_LIMIT_DEFAULT 200000
++#define OFPROTO_FLOW_LIMIT_DEFAULT 600000
+ #define OFPROTO_MAX_IDLE_DEFAULT 10000 /* ms */
+ #define OFPROTO_MAX_REVALIDATOR_DEFAULT 500 /* ms */
+ #define OFPROTO_MIN_REVALIDATE_PPS_DEFAULT 5
+diff --git a/vswitchd/vswitch.xml b/vswitchd/vswitch.xml
+index 3ddaaefda..b4ba5fd8e 100644
+--- a/vswitchd/vswitch.xml
++++ b/vswitchd/vswitch.xml
+@@ -710,6 +710,118 @@
+           The feature is considered experimental.
+         </p>
+       </column>
++      <column name="other_config" key="nmu-enable"
++              type='{"type": "boolean"}'>
++        <p>
++          Enable NuevoMatchUp in DPDK data-paths. Defaults to false.
++        </p>
++      </column>
++      <column name="other_config" key="nmu-cool-down-time-ms"
++              type='{"type": "integer", "minInteger": 10, "maxInteger": 100000}'>
++        <p>
++          Minimum time between two adjacent NuevoMatchUP training sessions.
++        </p>
++        <p>
++          Default to 2000 ms between training attempts.
++        </p>
++      </column>
++      <column name="other_config" key="nmu-error-threshold"
++              type='{"type": "integer", "minInteger": 2, "maxInteger": 8196}'>
++        <p>
++          NuevoMatchUp minimum number of rules per iSet.
++        </p>
++        <p>
++          Defaults to 128.
++        </p>
++      </column>
++      <column name="other_config" key="nmu-max-collision"
++              type='{"type": "integer", "minInteger": 1, "maxInteger": 64}'>
++        <p>
++          NuevoMatchUp number of rules per iSet bucket.
++        </p>
++        <p>
++          Defaults to 16.
++        </p>
++      </column>
++      <column name="other_config" key="nmu-minimal-coverage"
++              type='{"type": "integer", "minInteger": 1, "maxInteger": 100}'>
++        <p>
++          NuevoMatchUp minimal coverage for valid iSets.
++        </p>
++        <p>
++          Defaults to 25 (%).
++        </p>
++      </column>
++      <column name="other_config" key="nmu-train-threshold"
++              type='{"type": "integer", "minInteger": 0, "maxInteger": 100}'>
++        <p>
++          NuevoMatchUp training sessions will start when NMU coverage is below
++          that value.
++        </p>
++        <p>
++          Defaults to 90.
++        </p>
++      </column>
++      <column name="other_config" key="nmu-garbage-collection-ms"
++              type='{"type": "boolean"}'>
++        <p>
++          NuevoMatchUp intervals between garbage collection cycles..
++        </p>
++        <p>
++          Defaults to 0.
++        </p>
++      </column>
++      <column name="other_config" key="nmu-sessions"
++              type='{"type": "boolean"}'>
++        <p>
++          NuevoMatchUp number of training sessions per classifier.
++        </p>
++        <p>
++          Defaults to 6.
++        </p>
++      </column>
++      <column name="other_config" key="nmu-samples"
++              type='{"type": "integer", "minInteger": 0, "maxInteger": 100}'>
++        <p>
++          NuevoMatchUp number of training samples per session.
++        </p>
++        <p>
++          Defaults to 4000.
++        </p>
++      </column>
++      <column name="other_config" key="nmu-batching"
++              type='{"type": "boolean"}'>
++        <p>
++          NuevoMatchUp whether to use batch training.
++        </p>
++        <p>
++          Defaults to false.
++        </p>
++      </column>
++      <column name="other_config" key="nmu-use-cmpflows"
++              type='{"type": "boolean"}'>
++        <p>
++          NuevoMatchUp use computational flows (OVS-CFLOWS in the paper).
++        </p>
++        <p>
++          Defaults to false.
++        </p>
++      </column>
++      <column name="other_config" key="nmu-cmpflow-bridge-name"
++              type='{"type": "string"}'>
++        <p>
++          Name of the bridge that holds the rules for training cmpflows.
++        </p>
++      </column>
++      <column name="other_config" key="nmu-instant-remainder"
++              type='{"type": "boolean"}'>
++        <p>
++          NuevoMatchUp use instant remainder in OVS-CFLOWS setting.
++        </p>
++        <p>
++          Defaults to false.
++        </p>
++      </column>
+     </group>
+     <group title="Status">
+       <column name="next_cfg">

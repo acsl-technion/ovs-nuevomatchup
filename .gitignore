@@ -1,0 +1,4 @@
+dpdk/*
+ovs/*
+data/*
+scripts/.*
