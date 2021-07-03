@@ -1,4 +1,8 @@
 dpdk/*
 ovs/*
 data/*
+nuevomatchup/*
+simple-packet-gen/*
 scripts/.*
+simd.h
+.gdb_history
