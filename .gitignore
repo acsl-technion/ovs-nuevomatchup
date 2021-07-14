@@ -4,5 +4,8 @@ data/*
 nuevomatchup/*
 simple-packet-gen/*
 scripts/.*
+scripts/__pycache__
+data
 simd.h
 .gdb_history
+**/*.swp

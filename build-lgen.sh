@@ -7,13 +7,18 @@ pgen_dir=$my_dir/simple-packet-gen
 if [[ ! -e $pgen_dir ]]; then
     echo "Cloning simple-packet-gen"
     git clone git@github.com:alonrs/simple-packet-gen.git $pgen_dir
-    git checkout 170c4c76288cff7ff5ae950ab19db57f7b705f61
-    (cd $pgen_dir && ./build.sh && ./bind.sh)
+    git checkout f6799102b05980b3c5b76f58b1f550d3aeae4e9f
+    (cd $pgen_dir && ./build.sh)
+    make -C $pgen_dir -j4
 fi
 
 # Set configuration
 if [[ ! -e scripts/.config ]]; then
-    read -p "Enter STUB IP address: "
-    echo "stub_ip=$stub_ip" >> scripts/.config
+    read -p "Enter RX PCI bus (SUT->LGEN): " pci_rx
+    read -p "Enter TX PCI bus (LGEN->SUT): " pci_tx
+    read -p "Enter SUT IP address: " sut_ip
+    echo "pci_rx=$pci_rx" >> scripts/.config
+    echo "pci_tx=$pci_tx" >> scripts/.config
+    echo "sut_ip=$sut_ip" >> scripts/.config
 fi
 

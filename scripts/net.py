@@ -43,22 +43,24 @@ def start_server():
         s.bind(('0.0.0.0', port))
         s.listen()
         while running:
-            conn, addr = s.accept()
-            with conn:
-                data = get_data_ascii(conn)
-                print('Got \"%s\"' % data, flush=True)
-                if data == 'exit':
-                    running = False
-                else:
-                    retval = execute(data)
-                if retval == 0:
-                    print('Done')
-                    conn.sendall(b'done')
-                else:
-                    print('Error')
-                    conn.sendall(b'error')
-            print('Waiting for the next connection')
-
+            try:
+                conn, addr = s.accept()
+                with conn:
+                    data = get_data_ascii(conn)
+                    print('Got \"%s\"' % data, flush=True)
+                    if data == 'exit':
+                        running = False
+                    else:
+                        retval = execute(data)
+                    if retval == 0:
+                        print('Done')
+                        conn.sendall(b'done')
+                    else:
+                        print('Error')
+                        conn.sendall(b'error')
+                print('Waiting for the next connection')
+            except KeyboardInterrupt as e:
+                break
     print('Exiting server')
 
 
