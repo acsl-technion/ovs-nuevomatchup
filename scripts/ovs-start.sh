@@ -16,9 +16,11 @@ wait_enabled=false
 # Require the ruleset name
 if [[ ! -z $(get_flag help) ]]; then
     echo "Starts DPDK-OVS with custom configuration"
-    echo "Usage: $0 --ruleset RULESET [options]"
+    echo "Usage: $0 --ruleset RULESET --cores CORES [options]"
     echo "--autorun: Do not open less, run OVS and exit script"
     echo "--wait: Do not load rules before the user press ENTER"
+    echo "--cores: How many cores to assign to OVS (e.g., 4)"
+    echo "--llc: How many ways to assign to LLC using Intel CAT (e.g., 0x000f)"
     ovs_load_rules_help
     exit 1
 fi
@@ -26,6 +28,10 @@ fi
 # Parse arguments
 [[ ! -z $(get_flag autorun) ]] && autorun=true
 [[ ! -z $(get_flag wait) ]] && wait_enabled=true
+
+cores=$(get_flag cores)
+llc=$(get_flag llc)
+[[ -z $cores ]] && echo "--cores argument is missing!"
 
 echo "*** ovs-start.sh script start with arguments $@"
 
@@ -46,10 +52,10 @@ $ovs_ctl --no-ovs-vswitchd  \
 &> /dev/null
 
 # Configure DPDK 
-echo "Configuring OVS with DPDK..."
+echo "Configuring OVS with DPDK, 2 PMD threads..."
 $ovs_vsctl --no-wait \
     set Open_vSwitch . other_config:dpdk-init=true -- \
-    set Open_vSwitch . other_config:pmd-cpu-mask="$pmd_cores"
+    set Open_vSwitch . other_config:pmd-cpu-mask="0x0003"
 
 # Start vswitchd
 echo "Starting OVS vswitchd..."
@@ -67,8 +73,17 @@ if [[ $result != true ]]; then
 fi
 
 # Set CPU affinity
-echo "Settings OVS affinity to cores $pmd_cores"
-taskset -cp $pmd_cores $(pgrep "ovs-vswi")
+echo "Settings OVS affinity to cores 1-$cores"
+taskset -cp "1-$cores" $(pgrep "ovs-vswi")
+
+# Set LLC using Intel CAT
+if [[ ! -z $llc ]]; then
+    echo "Set LLC to $llc using Intel CAT..."
+    numcpu=$(cat /proc/cpuinfo | grep processor | wc -l)
+    (( lastcpu=$numcpu-1 ))
+    pqos -e "llc:1=$llc"
+    pqos -a "llc:1=0-$lastcpu;"
+fi
 
 [[ $wait_enabled == true ]] && read -p "[Press ENTER to continue]"
 

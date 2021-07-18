@@ -35,10 +35,8 @@ if [[ ! -e scripts/.config ]]; then
 
     read -p "Enter RX PCI bus (LGEN->SUT): " pci_rx
     read -p "Enter TC PCI bus (SUT->LGEN): " pci_tx
-    read -p "Enter Open vSwitch PMD cores (e.g., 1-6): " pmd_cores
     echo "pci_rx=$pci_rx" >> scripts/.config
     echo "pci_tx=$pci_tx" >> scripts/.config
-    echo "pmd_cores=$pmd_cores" >> scripts/.config
 fi
 
 if [[ ! -e $ovs_dir ]]; then

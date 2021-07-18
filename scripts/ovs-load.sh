@@ -19,11 +19,14 @@ source $scripts_dir/ovs-common.sh
 # Require the ruleset name
 if [[ ! -z $(get_flag help) ]]; then
     echo "Loads a given ruleset to a running instance of OVS"
-    echo "Usage: $0 --ruleset RULESET [options]"
+    echo "Usage: $0 --ruleset RULESET --n-revalidator VALUE" \
+         "--n-handler VALUE [options]"
     echo "--emc: Start OVS with EMC"
     echo "--smc: Start OVS with SMC"
     echo "--ovs-ccache: Start OVS with computational cache"
     echo "--ovs-cflows: Start OVS with computational flows"
+    echo "--n-revalidator: Number of revalidator threads"
+    echo "--n-handler: Number of handler threads"
     ovs_load_rules_help
     exit 1
 fi
@@ -34,6 +37,14 @@ fi
 [[ ! -z $(get_flag smc) ]] && smc_enabled=true
 [[ ! -z $(get_flag ovs-ccache) ]] && ccache_enabled=true && nmu_enabled=true
 [[ ! -z $(get_flag ovs-cflows) ]] && cflows_enabled=true && nmu_enabled=true
+
+n_revalidator=$(get_flag n-revalidator)
+n_handler=$(get_flag n-handler)
+
+if [[ -z $n_revalidator || -z $n_handler ]]; then
+    echo "Please conifgure number of revalidator and handler threads."
+    exit 1
+fi
 
 # Check ruleset is valid
 if [[ ! -d $generated_dir/$ruleset ]]; then
@@ -49,6 +60,7 @@ if [[ ! -e $ovs_flows ]]; then
 fi
 
 # Delete exising bridges
+echo "Deleting any existing bridges..."
 $ovs_vsctl del-br $ovs_br
 
 # Apply NuevoMatch configuration
@@ -63,14 +75,11 @@ if [[ -e $scripts_dir/.ovs-config ]]; then
     $scripts_dir/.ovs-config
 fi
 
-# Set number of revalidator threads
-if [[ $nmu_enabled ]]; then
-    ovs-vsctl --no-wait \
-    set Open_vSwitch . other_config:n-revalidator-threads=3
-else
-    ovs-vsctl --no-wait \
-    set Open_vSwitch . other_config:n-revalidator-threads=4
-fi
+# Set number of revalidator/handler threads
+echo "Using $n_revalidator revalidator and $n_handler handler threads"
+ovs-vsctl --no-wait \
+    set Open_vSwitch . other_config:n-revalidator-threads=$n_revalidator -- \
+    set Open_vSwitch . other_config:n-handler-threads=$n_handler
 
 # Apply configuration
 ovs-vsctl --no-wait \

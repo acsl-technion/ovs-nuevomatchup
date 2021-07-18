@@ -39,28 +39,32 @@ def send(ip, data):
 def start_server():
     print('Starting server, listening on port %d' % port)
     running = True
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(('0.0.0.0', port))
-        s.listen()
+    s=socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(('0.0.0.0', port))
+    s.listen()
+    try:
         while running:
+            conn, addr = s.accept()
             try:
-                conn, addr = s.accept()
-                with conn:
-                    data = get_data_ascii(conn)
-                    print('Got \"%s\"' % data, flush=True)
-                    if data == 'exit':
-                        running = False
-                    else:
-                        retval = execute(data)
-                    if retval == 0:
-                        print('Done')
-                        conn.sendall(b'done')
-                    else:
-                        print('Error')
-                        conn.sendall(b'error')
+                data = get_data_ascii(conn)
+                print('Got \"%s\"' % data, flush=True)
+                if data == 'exit':
+                    running = False
+                else:
+                    retval = execute(data)
+                if retval == 0:
+                    print('Done')
+                    conn.sendall(b'done')
+                else:
+                    print('Error')
+                    conn.sendall(b'error')
                 print('Waiting for the next connection')
             except KeyboardInterrupt as e:
-                break
+                running = False
+            conn.close()
+    except:
+        pass
+    s.close()
     print('Exiting server')
 
 

@@ -34,6 +34,10 @@ kill -9 $(pgrep ovs-vs) 2>/dev/null
 
 $scripts_dir/mem-clean.sh
 
+# Reset Intal CAT settings
+echo "Reseting Intel CAT settings..."
+pqos -R
+
 # Copy last OVS log 
 cp $ovs_log_file $log_dir/ovs.log
 chmod +r $log_dir/ovs.log

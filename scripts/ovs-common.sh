@@ -57,7 +57,7 @@ function timer_sample() {
     fi
     (( timer_counter+=1 ))
     (( timer_total=$timer_total+$timer_diff ))
-    (( timer_sleep=$timer_total/$timer_counter ))
+    (( timer_sleep_ms=$timer_total/$timer_counter ))
     timer_current=$timer_current_n
 }
 
@@ -71,11 +71,26 @@ function timer_reset() {
 # Make sure to sleep exacly the required amount of seconds between
 # each two function invocations
 function timer_sleep() {
-    sleep $(echo $timer_sleep/1000 | bc -l)
+    sleep $(echo $timer_sleep_ms/1000 | bc -l)
+}
+
+# Set the base/add/delete rules to work with
+function ovs_load_rules_set() {
+    [[ $initial_rules -eq 0 ]] && initial_rules=10
+    bse_flows=$(echo "$flows" | head -n $initial_rules)
+    add_rules=$(echo "$flows" | tail -n +$(( $initial_rules+1 )))
+    del_rules=$(echo "$add_rules" | sed 's/add//g;s/, prio.*//g') 
+
+    echo "*** Loading $initial_rules rules..." | tee -a $ovs_log_file
+    echo "$bse_flows" | $ovs_ofctl --bundle add-flow $ovs_br -
+
+    (( total-=$initial_rules ))
 }
 
 # Load rules in rate experiments
-function ovs_load_rules_with_rate() {
+function ovs_load_rules_update() {
+    ovs_load_rules_set
+
     echo "*** Rate experiment - using $rate flows from $ruleset" \
          "initial delay of $initial_delay sec" | \
          tee -a $ovs_log_file
@@ -122,7 +137,7 @@ function ovs_load_rules_with_rate() {
 # Wait until $1 rules are loaded into OVS
 function ovs_load_rules_wait() {
     r=0
-    while (( r< $1 )); do
+    while (( r<$1 )); do
         [[ ! -e $ovs_log_file ]] && break
         r=$(tail $ovs_log_file | grep flow_mods | awk '{x+=$2}END{print x}')
     done
@@ -140,25 +155,15 @@ function ovs_load_rules() {
     total=$(echo "$flows" | wc -l)
 
     # In case we do not update rules on the fly
-    if [[ $rate -eq 0 && $initial_rules -eq 0 ]]; then
+    if [[ $rate -eq 0 ]]; then
         echo "*** Loading OF rules from $ruleset (total $total OF rules)" | \
         tee -a $ovs_log_file
         echo "$flows" | $ovs_ofctl --bundle add-flow $ovs_br -
         ovs_load_rules_wait $total
-        return
+    else
+        ovs_load_rules_set
+        ovs_load_rules_wait $initial_rules
     fi
-
-    [[ $initial_rules -eq 0 ]] && initial_rules=10
-    bse_flows=$(echo "$flows" | head -n $initial_rules)
-    add_rules=$(echo "$flows" | tail -n +$(( $initial_rules+1 )))
-    del_rules=$(echo "$add_rules" | sed 's/add//g;s/, prio.*//g') 
-    (( total-=$initial_rules ))
-
-    echo "*** Loading $initial_rules rules..." | tee -a $ovs_log_file
-    echo "$bse_flows" | $ovs_ofctl --bundle add-flow $ovs_br -
-    ovs_load_rules_wait $initial_rules
-
-    ovs_load_rules_with_rate
 }
 
 
