@@ -430,6 +430,25 @@ function extract_first_col_values() {
     sudo awk '{print $1}' <&0 2>/dev/null | sort | uniq
 }
 
+# Push values (${@:2:}) to queue ($1)
+# Usage example: queue_push queue a b c d
+function queue_push() {
+    cmd="$1=\"\$$1 ${@:2}\""
+    eval "$cmd"
+}
+
+# Pops from queue ($1) X values ($2) into variable $3
+# Usage example: queue_pop queue 2 dst
+function queue_pop() {
+    values=$(eval "echo \"\$$1\"")
+    values=$(echo "$values" | sed -E 's/^\s+//g') 
+    (( from=$2+1 ))
+    vals=$(echo "$values" | cut -d" " -f1-$2)
+    new_queue=$(echo "$values" | cut -d" " -f$from-)
+    eval "$1=\"$new_queue\""
+    eval "$3=\"$vals\""
+}
+
 # Wait for any command on port
 # @param $1 port 
 # @param $2 msg
