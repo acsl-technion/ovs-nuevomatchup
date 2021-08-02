@@ -65,12 +65,12 @@
 
 /* Extract 'FIELD' from 'FLOW_P' and 'WILDCARD_P', then populate 'FIELD'
  * of 'CMPFLOW' with values of 'SIZE' bits */
-#define NMUCLS_EXTRACT_FIELD(FIELD, FLOW_P, WILDCARD_P, CMPFLOW, IDX, SIZE)    \
-do {                                                                          \
-    uint##SIZE##_t mask = NMUCLS_NTHBE_##SIZE(WILDCARD_P->masks.FIELD);        \
-    CMPFLOW.fields[IDX].low = NMUCLS_NTHBE_##SIZE(FLOW_P->FIELD) & mask;       \
-    CMPFLOW.fields[IDX].high = (CMPFLOW.fields[IDX].low | ~mask) &            \
-                               NMUCLS_BITMASK_##SIZE;                          \
+#define NMUCLS_EXTRACT_FIELD(FIELD, FLOW_P, WILDCARD_P, CMPFLOW, IDX, SIZE)  \
+do {                                                                         \
+    uint##SIZE##_t mask = NMUCLS_NTHBE_##SIZE(WILDCARD_P->masks.FIELD);      \
+    CMPFLOW.fields[IDX].low = NMUCLS_NTHBE_##SIZE(FLOW_P->FIELD) & mask;     \
+    CMPFLOW.fields[IDX].high = (CMPFLOW.fields[IDX].low | ~mask) &           \
+                               NMUCLS_BITMASK_##SIZE;                        \
 } while (0);
 
 VLOG_DEFINE_THIS_MODULE(dpif_netdev_nmu);
@@ -115,7 +115,7 @@ struct nmucls {
     long long int cmpflow_sync_time;
     long long int garbage_time;
     bool thread_running;
-    pthread_t trainer_thread;
+    pthread_t manager_thread;
     atomic_bool enabled;
 };
 
@@ -231,6 +231,10 @@ nmu_extract_flow_fields(const struct netdev_flow_key** keys,
                         uint32_t *header_p);
 
 static struct cmpflow_item* cmpflow_lookup(struct nmucls *, uint64_t id);
+
+static void trainer_thread_ref(void);
+static int trainer_thread_unref(void);
+static bool trainer_thread_produce(struct nmucls *nmucls);
 
 #endif
 
@@ -375,7 +379,7 @@ nmucls_destroy(struct nmucls *nmucls)
     }
 #ifdef HAVE_NUEVOMATCHUP
     atomic_store(&nmucls->enabled, false);
-    xpthread_join(nmucls->trainer_thread, NULL);
+    xpthread_join(nmucls->manager_thread, NULL);
     nmu_destroy(nmucls);
     cmap_destroy(&nmucls->cmpflow_table);
     free(nmucls->nmt);
@@ -554,23 +558,23 @@ struct classifier_version {
 
 /* Necessary information and status on rules and flows */
 struct rule_info {
-    struct cmap_node node;          /* Within nmu_trainer */
+    struct cmap_node node;            /* Within nmu_trainer */
 
-    struct ovs_spin lock;           /* Prevent multiple writers */
+    struct ovs_spin lock;             /* Prevent multiple writers */
     struct cmpflow *cmpflow;          /* Pointer to cmpflow from netdev */
-    void *rule_p;                   /* Pointer to unique dpcls rule */
+    void *rule_p;                     /* Pointer to unique dpcls rule */
 
     bool in_lib;                      /* Held by libnuevomatchup */
     bool removed;                     /* Removed by a revalidator */
     bool delete_me;                   /* Marked for garbage collection */
     enum lnmu_inclusion_policy flags; /* Allow in iSet/Remainder/Both */
 
-    uint32_t hash;                  /* Hash for "rule_map" */
-    uint32_t lib_unique_id;         /* Unique id in libnuevomatchup */
-    int version;                    /* Classifier version */
-    int subset_idx;                 /* iSet index or -1 for remainder */
+    uint32_t hash;                    /* Hash for "rule_map" */
+    uint32_t lib_unique_id;           /* Unique id in libnuevomatchup */
+    int version;                      /* Classifier version */
+    int subset_idx;                   /* iSet index or -1 for remainder */
 
-    struct lnmu_flow flow;          /* 5-tuple flow for libnuevomatchup */
+    struct lnmu_flow flow;            /* 5-tuple flow for libnuevomatchup */
 };
 
 /* Items in nmucls->cmpflow_table */
@@ -3018,11 +3022,11 @@ nmucls_run__(struct nmucls *nmucls)
 
     /* Initiate trainer thread */
     ds_init(&ds);
-    ds_put_format(&ds, "nmu-trainer-pmd");
-    nmucls->trainer_thread = ovs_thread_create(ds_cstr(&ds),
+    ds_put_format(&ds, "nmu-manager-pmd");
+    nmucls->manager_thread = ovs_thread_create(ds_cstr(&ds),
                                                nmucls_thread_main,
                                                nmucls);
-    VLOG_INFO("NuevoMatchUp trainer thread for PMD created.");
+    VLOG_INFO("NuevoMatchUp manager thread for PMD created.");
     nmucls->thread_running = true;
     ds_destroy(&ds);
 }
@@ -3411,6 +3415,8 @@ nmucls_thread_main(void* args)
         nmucls->cfg->use_cmpflows = 0;
     }
 
+    trainer_thread_ref();
+
     while(nmucls->enabled) {
 
         xnanosleep(ns_to_wait + ns_penalty);
@@ -3423,7 +3429,12 @@ nmucls_thread_main(void* args)
         }
 
         nmu_preprocess_rules(nmucls);
-        nmu_train(nmucls, &result);
+
+        /* When training occurs here; does not scale to many manager threads */
+        /* nmu_train(nmucls, &result); */
+        /* Producer-consumer to a single trainer thread */
+        result = trainer_thread_produce(nmucls);
+
         nmu_postprocess_rules(nmucls);
         nmu_move_rules_from_isets(nmucls);
         nmu_switch(nmucls);
@@ -3471,8 +3482,149 @@ nmucls_thread_main(void* args)
     }
 
     cmpflow_clean(nmucls, true);
-    VLOG_INFO("NuevoMatch trainer exit");
+    trainer_thread_unref();
+
+    VLOG_INFO("NuevoMatch PMD manager exit");
     return NULL;
+}
+
+
+/* Trainer thread */
+
+#define TRAINER_SLEEP_NS 10000
+
+enum { TRAINER_RING_SIZE = 32 };
+enum trainer_status {
+    TRAINER_STATUS_EMPTY = 0,
+    TRAINER_STATUS_FULL,
+    TRAINER_STATUS_READY
+};
+
+/* Trainer thread ring element */
+OVS_ALIGNED_STRUCT(CACHE_LINE_SIZE, trainer_ring_element) {
+    struct nmucls *nmucls;
+    enum trainer_status status;
+    bool result;
+};
+
+/* Trainer ring */
+static struct trainer_ring_element trainer_ring[TRAINER_RING_SIZE];
+static atomic_int trainer_cursor_write;
+static struct ovs_mutex trainer_write_lock;
+
+/* Trainer thread */
+static atomic_int trainer_thread_client_num = 0;
+
+static pthread_t trainer_thread;
+
+/* Trainer thread main loop */
+static void* trainer_thread_main(void *args __always_unused)
+{
+    struct trainer_ring_element *elem;
+    struct trainer_ring_element new;
+    int client_no;
+    int read_cursor;
+
+    VLOG_INFO("NMU trainer thread start");
+    read_cursor = 0;
+
+    while (1) {
+        atomic_read_relaxed(&trainer_thread_client_num, &client_no);
+        if (!client_no) {
+            break;
+        }
+
+        xnanosleep(TRAINER_SLEEP_NS);
+
+        elem = &trainer_ring[read_cursor];
+        if (elem->status != TRAINER_STATUS_FULL) {
+            continue;
+        }
+
+        VLOG_INFO("NMU trainer new element");
+
+        new = *elem;
+        nmu_train(new.nmucls, &new.result);
+        new.status = TRAINER_STATUS_READY;
+
+        /* Write to ring, single cache line */
+        *elem = new;
+        read_cursor = (read_cursor + 1) & (TRAINER_RING_SIZE-1);
+    }
+
+    VLOG_INFO("NMU trainer thread exit");
+    return NULL;
+}
+
+/* Produce to ring, waits and returns "nmu_train" result */
+static bool trainer_thread_produce(struct nmucls *nmucls)
+{
+    struct trainer_ring_element *elem;
+    struct trainer_ring_element new;
+    int write_cursor;
+
+    /* Lock on ring, wait for current slot to be empty */
+    ovs_mutex_lock(&trainer_write_lock);
+
+    atomic_add_relaxed(&trainer_cursor_write, 1, &write_cursor);
+    write_cursor &= (TRAINER_RING_SIZE-1);
+    elem = &trainer_ring[write_cursor];
+
+    while (elem->status != TRAINER_STATUS_EMPTY) {
+        xnanosleep(TRAINER_RING_SIZE * TRAINER_SLEEP_NS);
+    }
+    
+    /* Write to ring, unlock */
+    new.nmucls = nmucls;
+    new.status = TRAINER_STATUS_FULL;
+    *elem = new;
+    ovs_mutex_unlock(&trainer_write_lock);
+
+    /* Block reader untill slot is ready */
+    while (elem->status != TRAINER_STATUS_READY) {
+        xnanosleep(TRAINER_RING_SIZE * TRAINER_SLEEP_NS);
+    }
+
+    /* Update element status to empty */
+    elem->status = TRAINER_STATUS_EMPTY;
+
+    return elem->result;
+}
+
+/* Start the trainer thread */
+static void trainer_thread_ref(void)
+{
+    int old;
+
+    /* Register as a client */
+    atomic_add_relaxed(&trainer_thread_client_num, 1, &old);
+    if (old) {
+        return;
+    }
+
+    /* Initiate ring */
+    memset(&trainer_ring, 0, sizeof(trainer_ring));
+    atomic_store(&trainer_cursor_write, 0);
+    ovs_mutex_init(&trainer_write_lock);
+
+    /* Start trainer thread */
+    trainer_thread = ovs_thread_create("nmu-trainer",
+                                       trainer_thread_main,
+                                       NULL);
+}
+
+/* Decrease number of clients */
+static int trainer_thread_unref(void)
+{
+    int old;
+    atomic_sub_relaxed(&trainer_thread_client_num, 1, &old);
+    
+    /* Join with trainer thread */
+    if (old == 1) {
+        xpthread_join(trainer_thread, NULL);
+    }
+
+    return old;
 }
 
 #endif
