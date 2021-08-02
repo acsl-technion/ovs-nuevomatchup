@@ -31,6 +31,7 @@ fi
 
 cores=$(get_flag cores)
 llc=$(get_flag llc)
+
 [[ -z $cores ]] && echo "--cores argument is missing!"
 
 echo "*** ovs-start.sh script start with arguments $@"
@@ -52,10 +53,19 @@ $ovs_ctl --no-ovs-vswitchd  \
 &> /dev/null
 
 # Configure DPDK 
-echo "Configuring OVS with DPDK, 2 PMD threads..."
+echo "Configuring OVS with DPDK..."
 $ovs_vsctl --no-wait \
-    set Open_vSwitch . other_config:dpdk-init=true -- \
-    set Open_vSwitch . other_config:pmd-cpu-mask="0x0003"
+    set Open_vSwitch . other_config:dpdk-init=true
+
+
+# Set LLC using Intel CAT
+if [[ ! -z $llc ]]; then
+    echo "Set LLC to $llc using Intel CAT..."
+    numcpu=$(cat /proc/cpuinfo | grep processor | wc -l)
+    (( lastcpu=$numcpu-1 ))
+    pqos -e "llc:1=$llc"
+    pqos -a "llc:1=0-$lastcpu;"
+fi
 
 # Start vswitchd
 echo "Starting OVS vswitchd..."
@@ -75,15 +85,6 @@ fi
 # Set CPU affinity
 echo "Settings OVS affinity to cores 1-$cores"
 taskset -cp "1-$cores" $(pgrep "ovs-vswi")
-
-# Set LLC using Intel CAT
-if [[ ! -z $llc ]]; then
-    echo "Set LLC to $llc using Intel CAT..."
-    numcpu=$(cat /proc/cpuinfo | grep processor | wc -l)
-    (( lastcpu=$numcpu-1 ))
-    pqos -e "llc:1=$llc"
-    pqos -a "llc:1=0-$lastcpu;"
-fi
 
 [[ $wait_enabled == true ]] && read -p "[Press ENTER to continue]"
 
