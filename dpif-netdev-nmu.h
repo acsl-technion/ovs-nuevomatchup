@@ -49,7 +49,9 @@ void nmucls_lookup(struct nmucls *nmucls,
 void nmucls_print_rule_with_key(const struct nmucls *,
                                 const struct netdev_flow_key *key);
 
-void nmucls_print_stats(struct ds *reply, struct nmucls *nmucls);
+void nmucls_print_stats(struct ds *reply,
+                        struct nmucls *nmucls,
+                        const char *sep);
 
 void nmucls_rule_lock(struct nmucls *, struct dpcls_rule *);
 void nmucls_rule_unlock(struct nmucls *, struct dpcls_rule *);

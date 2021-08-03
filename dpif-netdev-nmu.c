@@ -180,7 +180,9 @@ static inline void nmu_lookup(struct nmucls *,
 static void nmu_init(struct nmucls *);
 static void nmu_destroy(struct nmucls *);
 
-static inline void nmu_print_stats(struct ds *reply, struct nmucls *nmucls);
+static inline void nmu_print_stats(struct ds *reply,
+                                   struct nmucls *nmucls,
+                                   const char *sep);
 static void nmu_rule_get_status(struct nmucls *,
                                 const struct dpcls_rule *rule,
                                 bool *in_nmu,
@@ -432,11 +434,12 @@ nmucls_print_rule_with_key(const struct nmucls __always_unused *nmucls,
 }
 
 void
-nmucls_print_stats(struct ds __always_unused *reply,
-                   struct nmucls __always_unused *nmucls)
+nmucls_print_stats(struct ds *reply,
+                   struct nmucls *nmucls,
+                   const char *sep)
 {
 #ifdef HAVE_NUEVOMATCHUP
-    nmu_print_stats(reply, nmucls);
+    nmu_print_stats(reply, nmucls, sep);
 #endif
 }
 
@@ -2886,7 +2889,7 @@ nmucls_remove__(struct nmucls *nmucls,
 }
 
 static inline void
-nmu_print_stats(struct ds *reply, struct nmucls *nmucls)
+nmu_print_stats(struct ds *reply, struct nmucls *nmucls, const char *sep)
 {
    if (!nmucls_enabled(nmucls)) {
        return;
@@ -2906,15 +2909,16 @@ nmu_print_stats(struct ds *reply, struct nmucls *nmucls)
    double avg_matches = nmu_stats->avg_matches / validations;
 
    ds_put_format(reply,
-           "  NuevoMatchUp avg. hit rate: %.03f\n"
-           "  NuevoMatchUp avg. parsing time: %.03f ns\n"
-           "  NuevoMatchUp avg. inference time: %.03f ns\n"
-           "  NuevoMatchUp avg. search time: %.03f ns\n"
-           "  NuevoMatchUp avg. validation time: %.03f ns\n"
-           "  NuevoMatchUp avg. remainder time: %.03f ns\n"
-           "  NuevoMatchUp avg. matches per entry: %.03f\n",
-           hit_rate, parsing_ns, inference_ns,
-           search_ns, validation_ns, remainder_ns, avg_matches);
+           "NuevoMatchUp avg. hit rate: %.03f%s"
+           "NuevoMatchUp avg. parsing time: %.03f ns%s"
+           "NuevoMatchUp avg. inference time: %.03f ns%s"
+           "NuevoMatchUp avg. search time: %.03f ns%s"
+           "NuevoMatchUp avg. validation time: %.03f ns%s"
+           "NuevoMatchUp avg. remainder time: %.03f ns%s"
+           "NuevoMatchUp avg. matches per entry: %.03f%s",
+           hit_rate, sep, parsing_ns, sep, inference_ns, sep,
+           search_ns, sep, validation_ns, sep,
+           remainder_ns, sep, avg_matches, sep);
 }
 
 static struct cmpflow_item*
