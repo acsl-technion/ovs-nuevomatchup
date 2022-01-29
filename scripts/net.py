@@ -4,17 +4,40 @@ import os
 import sys
 import socket
 import subprocess
+import signal
+import re
 
 port = 2001
+wait_for_process=True
 
 def get_data_ascii(conn):
     data=conn.recv(4096)
     return data.decode('ascii')
 
 
+def signal_handler(sig, frame):
+    global wait_for_process
+    print('Got siglal, returning status to client')
+    wait_for_process=False
+
+signal.signal(signal.SIGUSR1, signal_handler)
+
 def execute(command):
-    retval = os.system(command)
-    return os.WEXITSTATUS(retval)
+    global wait_for_process
+    # Change "$$" with my PID
+    command=re.sub('\$\$', str(os.getpid()), command)
+    p = subprocess.Popen(command.split())
+    while wait_for_process:
+        try:
+            p.wait(1)
+            break
+        except subprocess.TimeoutExpired as e:
+            pass
+    retval = p.returncode
+    if retval is None:
+        retval=0 
+    print('Returning retval %d' % retval, flush=True)
+    return retval
 
 
 def send(ip, data):
@@ -62,7 +85,7 @@ def start_server():
             except KeyboardInterrupt as e:
                 running = False
             conn.close()
-    except:
+    except KeyboardInterrupt as e:
         pass
     s.close()
     print('Exiting server')

@@ -9,9 +9,10 @@
 source $(readlink -f $(dirname $(readlink -f $0)))/common.sh
 source $scripts_dir/ovs-common.sh
 
-if [[ $# -le 2 ]]; then
+if [[ $(get_flag help) -eq 1 || $# -lt 2 ]]; then
     echo "Usage: $0 RULESET NAME [NAME..}"
     echo "Copies the last section within OVS log file to a dedicated file"
+    exit 0
 fi
 
 ruleset="$1"

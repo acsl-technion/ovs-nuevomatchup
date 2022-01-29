@@ -43,6 +43,7 @@ function ovs_load_rules_help() {
     echo "--initial-rules VAL: Used with --rate option, how many"      \
          "OpenFlow rules to load at the begining of the experimnet."
     echo "--do-not-delete: used with --rate option, do not delete old rules."
+    echo "--once: used with --rate option. Quit after one update."
 }
 
 # Sample the current timestamp in nanoseconds. Returns a string 
@@ -71,39 +72,44 @@ function timer_reset() {
 # Make sure to sleep exacly the required amount of seconds between
 # each two function invocations
 function timer_sleep() {
+    echo "Sleeping $timer_sleep_ms ms.."
     sleep $(echo $timer_sleep_ms/1000 | bc -l)
 }
 
 # Set the base/add/delete rules to work with
 function ovs_load_rules_set() {
-    [[ $initial_rules -eq 0 ]] && initial_rules=10
+    [[ $initial_rules -eq 0 ]] && initial_rules=$total
     bse_flows=$(echo "$flows" | head -n $initial_rules)
     add_rules=$(echo "$flows" | tail -n +$(( $initial_rules+1 )))
     del_rules=$(echo "$add_rules" | sed 's/add//g;s/, prio.*//g') 
-
-    echo "*** Loading $initial_rules rules..." | tee -a $ovs_log_file
-    echo "$bse_flows" | $ovs_ofctl --bundle add-flow $ovs_br -
-
     (( total-=$initial_rules ))
+}
+
+# Signal LGEN
+function signal_lgen() {
+    signal=$(get_flag signal)
+    [[ -z $signal ]] && return
+    kill -s USR1 $signal 
 }
 
 # Load rules in rate experiments
 function ovs_load_rules_update() {
-    ovs_load_rules_set
-
     echo "*** Rate experiment - using $rate flows from $ruleset" \
-         "initial delay of $initial_delay sec" | \
+         "initial delay of $initial_delay sec, " \
+         "total $total flows" | \
          tee -a $ovs_log_file
     echo "*** Rate experiment - waiting for LGEN to start..." | \
          tee -a $ovs_log_file
+    signal_lgen
     while [[ $(tail $ovs_log_file | grep "Extended stats" | wc -l) -eq 0 ]]
     do
         sleep 0.3
     done
     echo "*** Rate experiment - start"
-    timer_reset
     
     sleep $initial_delay
+    timer_reset
+
     for (( i=0; i<$total; i+=$rate )); do
         timer_sample
         echo "*** Rate experiment - iteration, $timer_val ms since last "
@@ -130,7 +136,13 @@ function ovs_load_rules_update() {
 
             timer_sleep
         fi
+
+        # Exit after one iteration?
+        if [[ ! -z $(get_flag once) ]]; then
+            break
+        fi
     done
+
     echo "*** Rate experiment - stop"
 }
 
@@ -146,23 +158,20 @@ function ovs_load_rules_wait() {
 # This function loads the rules in the background
 # Loads rules with rate "rate".
 function ovs_load_rules() {
-    # Delete all current OpenFlow rules in switch
-    $ovs_ofctl --bundle del-flows $ovs_br
-
     # Reverse the flows as they are
     # ordered from most specifict to least specific
     flows=$(tac $ovs_flows)
     total=$(echo "$flows" | wc -l)
+    ovs_load_rules_set
 
     # In case we do not update rules on the fly
     if [[ $rate -eq 0 ]]; then
-        echo "*** Loading OF rules from $ruleset (total $total OF rules)" | \
+        echo "*** Loading $initial_rules OF rules from $ruleset" | \
         tee -a $ovs_log_file
-        echo "$flows" | $ovs_ofctl --bundle add-flow $ovs_br -
-        ovs_load_rules_wait $total
-    else
-        ovs_load_rules_set
+        echo "$bse_flows" | $ovs_ofctl --bundle add-flow $ovs_br -
         ovs_load_rules_wait $initial_rules
+    else
+        ovs_load_rules_update
     fi
 }
 

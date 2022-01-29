@@ -381,11 +381,14 @@ function compute_cdf() {
 # Smooths the data points by a moving average with size $1.
 # @input data points
 # @param $1 window size
+# @param $2 Column index (default 1)
 # @output The smoothed points
 function smooth_by_moving_average() {
-    awk -v w=$1 '{i=(NR-1)%w; x[i] = $1 }                            \
-                 NR>w { t=0; for (i=0; i<w; ++i) t+=x[i]; print t/w} \
-                 NR<w {print $1}' <&0
+    idx=$(echo $2 | default 1)
+    awk -v w=$1 -v idx=$idx ' \
+    {i=(NR-1)%w; x[i] = $idx }
+    NR>w { t=0; for (i=0; i<w; ++i) t+=x[i]; print t/w}
+    NR<w {print $idx}' <&0
 }
 
 # Smooths the data points by a moving average with size $1, per column
