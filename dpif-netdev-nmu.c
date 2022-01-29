@@ -183,6 +183,8 @@ static void nmu_destroy(struct nmucls *);
 static inline void nmu_print_stats(struct ds *reply,
                                    struct nmucls *nmucls,
                                    const char *sep);
+static inline void nmu_clear_stats(struct nmucls *nmucls);
+
 static void nmu_rule_get_status(struct nmucls *,
                                 const struct dpcls_rule *rule,
                                 bool *in_nmu,
@@ -440,6 +442,14 @@ nmucls_print_stats(struct ds *reply,
 {
 #ifdef HAVE_NUEVOMATCHUP
     nmu_print_stats(reply, nmucls, sep);
+#endif
+}
+
+void
+nmucls_clear_stats(struct nmucls __always_unused *nmucls)
+{
+#ifdef HAVE_NUEVOMATCHUP
+    nmu_clear_stats(nmucls); 
 #endif
 }
 
@@ -2275,6 +2285,7 @@ nmu_insert(struct nmucls *nmucls,
 {
     struct rule_info *info, *node;
     struct nmu_trainer *nmt;
+    bool insert_to_remainder;
 
     info = xmalloc(sizeof *info);
     info->removed = false;
@@ -2309,8 +2320,11 @@ nmu_insert(struct nmucls *nmucls,
     nmt->num_of_total_rules_out++;
     nmt->updates = true;
 
-    /* In case of cmpflows, insert the rule now to active remainder */
-    if (nmt->instant_remainder && nmu_cmpflow_enabled(nmucls)) {
+    /* In case of cmpflows, and instant remainder (or priority zero),
+     * insert the rule now to active remainder */
+    insert_to_remainder = (nmt->instant_remainder) ||
+                          (cmpflow->priority == 0);
+    if (nmu_cmpflow_enabled(nmucls) && insert_to_remainder) {
         ovs_spin_lock(&nmt->remainder_lock);
         int error = lnmu_insert(&nmt->trainer, &info->flow,
                                          nmt->active->rem,
@@ -2321,8 +2335,7 @@ nmu_insert(struct nmucls *nmucls,
             VLOG_WARN("%s", nmt->trainer.error);
         }
         info->in_lib = true;
-        info->flags = LNMU_INCLUSION_ALLOW_IN_ISET |
-                      LNMU_INCLUSION_ALLOW_IN_REMAINDER;
+        info->flags |= LNMU_INCLUSION_ALLOW_IN_REMAINDER;
         nmt->updates = true;
     }
 
@@ -2889,36 +2902,47 @@ nmucls_remove__(struct nmucls *nmucls,
 }
 
 static inline void
+nmu_clear_stats(struct nmucls *nmucls)
+{
+    if (!nmucls_enabled(nmucls)) {
+        return;
+    }
+    memset(&nmucls->nmt->stats, 0, sizeof(struct nmu_statistics));
+}
+ 
+static inline void
 nmu_print_stats(struct ds *reply, struct nmucls *nmucls, const char *sep)
 {
-   if (!nmucls_enabled(nmucls)) {
-       return;
-   }
-   const struct nmu_statistics *nmu_stats = &nmucls->nmt->stats;
+    if (!nmucls_enabled(nmucls)) {
+        return;
+    }
+    const struct nmu_statistics *nmu_stats = &nmucls->nmt->stats;
+ 
+    double total_packets = nmu_stats->total_packets ?
+                           nmu_stats->total_packets : 1;
+    double validations = nmu_stats->num_validations ?
+                         nmu_stats->num_validations : 1;
+    double hit_rate = nmu_stats->hit_count / total_packets;
+    double parsing_ns = nmu_stats->parsing_ns / total_packets;
+    double remainder_ns = nmu_stats->remainder_ns / total_packets;
+    double inference_ns = nmu_stats->inference_ns / total_packets;
+    double search_ns = nmu_stats->search_ns / total_packets;
+    double validation_ns = nmu_stats->validation_ns / total_packets;
+    double avg_matches = nmu_stats->avg_matches / validations;
+    double coverage = nmu_get_coverage(nmucls);
 
-   double total_packets = nmu_stats->total_packets ?
-                          nmu_stats->total_packets : 1;
-   double validations = nmu_stats->num_validations ?
-                        nmu_stats->num_validations : 1;
-   double hit_rate = nmu_stats->hit_count / total_packets;
-   double parsing_ns = nmu_stats->parsing_ns / total_packets;
-   double remainder_ns = nmu_stats->remainder_ns / total_packets;
-   double inference_ns = nmu_stats->inference_ns / total_packets;
-   double search_ns = nmu_stats->search_ns / total_packets;
-   double validation_ns = nmu_stats->validation_ns / total_packets;
-   double avg_matches = nmu_stats->avg_matches / validations;
-
-   ds_put_format(reply,
-           "NuevoMatchUp avg. hit rate: %.03f%s"
-           "NuevoMatchUp avg. parsing time: %.03f ns%s"
-           "NuevoMatchUp avg. inference time: %.03f ns%s"
-           "NuevoMatchUp avg. search time: %.03f ns%s"
-           "NuevoMatchUp avg. validation time: %.03f ns%s"
-           "NuevoMatchUp avg. remainder time: %.03f ns%s"
-           "NuevoMatchUp avg. matches per entry: %.03f%s",
-           hit_rate, sep, parsing_ns, sep, inference_ns, sep,
-           search_ns, sep, validation_ns, sep,
-           remainder_ns, sep, avg_matches, sep);
+    ds_put_format(reply,
+            "NuevoMatchUp avg. hit rate: %.03f%s"
+            "NuevoMatchUp coverage: %.2lf%s"
+            "NuevoMatchUp avg. parsing time: %.03f ns%s"
+            "NuevoMatchUp avg. inference time: %.03f ns%s"
+            "NuevoMatchUp avg. search time: %.03f ns%s"
+            "NuevoMatchUp avg. validation time: %.03f ns%s"
+            "NuevoMatchUp avg. remainder time: %.03f ns%s"
+            "NuevoMatchUp avg. matches per entry: %.03f%s",
+            hit_rate, sep, coverage, sep, parsing_ns, sep, inference_ns, sep,
+            search_ns, sep, validation_ns, sep,
+            remainder_ns, sep, avg_matches, sep);
 }
 
 static struct cmpflow_item*
@@ -3544,8 +3568,6 @@ static void* trainer_thread_main(void *args __always_unused)
         if (elem->status != TRAINER_STATUS_FULL) {
             continue;
         }
-
-        VLOG_INFO("NMU trainer new element");
 
         new = *elem;
         nmu_train(new.nmucls, &new.result);
