@@ -7,7 +7,7 @@ devbind=$pgen_dir/dpdk/usertools/dpdk-devbind.py
 # Download and make packet generator
 if [[ ! -e $pgen_dir ]]; then
     echo "Cloning simple-packet-gen"
-    git clone git@github.com:alonrs/simple-packet-gen.git $pgen_dir
+    git clone https://github.com/alonrs/simple-packet-gen.git $pgen_dir
     git -C $pgen_dir checkout 1ba09a229ac025e15d7816e290ed76b60fcc24da
     (cd $pgen_dir && ./build.sh)
     make -C $pgen_dir -j4
