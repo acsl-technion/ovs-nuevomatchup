@@ -392,7 +392,7 @@ index 68c33a0f9..ce7ce8606 100644
 +void dp_netdev_pmd_unlock(struct dp_netdev_pmd_thread *pmd);
 +void dp_netdev_pmd_unlock(struct dp_netdev_pmd_thread *pmd);
 +long long dp_netdev_pmd_now(struct dp_netdev_pmd_thread *pmd);
-+int dp_netdev_pmd_get_port_by_name(struct dp_netdev_pmd_thread *pmd, 
++int dp_netdev_pmd_get_port_by_name(struct dp_netdev_pmd_thread *pmd,
 +                                   const char *name,
 +                                   odp_port_t *port_no_p);
 +
@@ -536,13 +536,13 @@ index 42e1c44ae..c172d3431 100644
 +    pmd->log_timestamp = time_msec();
 +
 +    pmd_perf_read_counters(&pmd->perf_stats, stats);
-+    
++
 +    lookups_per_hit = 0;
 +    if (stats[PMD_STAT_MASKED_HIT] > 0) {
 +        lookups_per_hit = stats[PMD_STAT_MASKED_LOOKUP]
 +                            / (double) stats[PMD_STAT_MASKED_HIT];
 +    }
-+    
++
 +    ds_init(&ds);
 +    nmucls_print_stats(&ds, pmd->nmucls, " ");
 +
@@ -746,7 +746,7 @@ index 42e1c44ae..c172d3431 100644
 +}
 +
 +int
-+dp_netdev_pmd_get_port_by_name(struct dp_netdev_pmd_thread *pmd, 
++dp_netdev_pmd_get_port_by_name(struct dp_netdev_pmd_thread *pmd,
 +                               const char *name,
 +                               odp_port_t *port_no_p)
 +{
@@ -1403,27 +1403,6 @@ index add3aabcc..9fba61c4d 100644
 +   fi
 +   AM_CONDITIONAL([HAVE_NUEVOMATCHUP], [test "$HAVE_NUEVOMATCHUP" = yes])
 +   AC_SUBST([HAVE_NUEVOMATCHUP])])
-diff --git a/manpages.mk b/manpages.mk
-index dc201484c..54a3a82ad 100644
---- a/manpages.mk
-+++ b/manpages.mk
-@@ -104,7 +104,6 @@ utilities/bugtool/ovs-bugtool.8: \
- utilities/bugtool/ovs-bugtool.8.in:
- lib/ovs.tmac:
- 
--
- utilities/ovs-dpctl-top.8: \
- 	utilities/ovs-dpctl-top.8.in \
- 	lib/ovs.tmac
-@@ -155,8 +154,6 @@ lib/common-syn.man:
- lib/common.man:
- lib/ovs.tmac:
- 
--lib/ovs.tmac:
--
- utilities/ovs-testcontroller.8: \
- 	utilities/ovs-testcontroller.8.in \
- 	lib/common.man \
 diff --git a/ofproto/ofproto-dpif-upcall.c b/ofproto/ofproto-dpif-upcall.c
 index 3a290e491..31ec13fcc 100644
 --- a/ofproto/ofproto-dpif-upcall.c
@@ -1857,10 +1836,10 @@ index c9d5df34b..59c00b74f 100644
  void rule_dpif_credit_stats(struct rule_dpif *,
                              const struct dpif_flow_stats *, bool);
 diff --git a/vswitchd/vswitch.xml b/vswitchd/vswitch.xml
-index 3ddaaefda..b4ba5fd8e 100644
+index 3ddaaefda..7ff561017 100644
 --- a/vswitchd/vswitch.xml
 +++ b/vswitchd/vswitch.xml
-@@ -710,6 +710,118 @@
+@@ -710,6 +710,91 @@
            The feature is considered experimental.
          </p>
        </column>
@@ -1923,33 +1902,6 @@ index 3ddaaefda..b4ba5fd8e 100644
 +        </p>
 +        <p>
 +          Defaults to 0.
-+        </p>
-+      </column>
-+      <column name="other_config" key="nmu-sessions"
-+              type='{"type": "boolean"}'>
-+        <p>
-+          NuevoMatchUp number of training sessions per classifier.
-+        </p>
-+        <p>
-+          Defaults to 6.
-+        </p>
-+      </column>
-+      <column name="other_config" key="nmu-samples"
-+              type='{"type": "integer", "minInteger": 0, "maxInteger": 100}'>
-+        <p>
-+          NuevoMatchUp number of training samples per session.
-+        </p>
-+        <p>
-+          Defaults to 4000.
-+        </p>
-+      </column>
-+      <column name="other_config" key="nmu-batching"
-+              type='{"type": "boolean"}'>
-+        <p>
-+          NuevoMatchUp whether to use batch training.
-+        </p>
-+        <p>
-+          Defaults to false.
 +        </p>
 +      </column>
 +      <column name="other_config" key="nmu-use-cmpflows"
