@@ -34,7 +34,7 @@ function stopall() {
 }
 trap stopall "INT"
 
-expr_list="cores throughput"
+expr_list="cores thr-caida-3m"
 rulesets=$(ls $ruleset_dir | grep -P "acl|fw|ipc" | sort -n)
 
 # Show usage message
