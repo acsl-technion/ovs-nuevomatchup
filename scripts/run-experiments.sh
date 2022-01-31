@@ -271,6 +271,7 @@ if check-expr manual; then
     read -p "Start options:" start_options
     read -p "Load options:" load_options
     read -p "Methods:" methods
+    read -p "EMC flag:" emc_flag
     read -p "Custom speed configuration:" lgen_options_custom
     read -p "Custom OVS configuration:" custom_ovs_config
     read -p "Custom experiment name:" experiment
@@ -284,7 +285,8 @@ if check-expr manual; then
 
     for ruleset in $rulesets; do
        send-sut ./scripts/ovs-start.sh --autorun $start_options
-       for method in "$methods"; do
+       for method in $methods; do
+           echo "Method: $method"
            lgen --ruleset $ruleset --locality $locality --ipg $ipg
        done
        commit-ruleset $ruleset $experiment
@@ -342,24 +344,25 @@ if check-expr cores; then
     done
 fi
 
-# Perform zipf experiment
-if check-expr zipf; then
+# Perform Megaflow cache size experiment
+if check-expr megaflow; then
     # Set constants for these experiments
-    rulesets="acl1-1k acl2-1k acl5-1k"
+    locality=caida-3m
+    ipg=caida-3m-diff
+    rulesets="acl5-500k"
     start_options="--cores 2"
-    load_options="--n-handler 1 --n-revalidator 1 --n-rxq 1"
     for ruleset in $rulesets; do
-        for alpha in 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9; do
-            if ! check-ruleset $ruleset thr-zipf-$alpha; then
+        for s in 800000 400000 200000 100000 50000 25000 12000 5000 1000; do
+            name=megaflow-$s
+            if ! check-ruleset $ruleset $name; then
                 continue
             fi
-            locality=zipf-$alpha
-            ipg=zipf-$alpha-diff
+            load_options="--n-rxq 1 --flow-limit $s"
             send-sut ./scripts/ovs-start.sh --autorun $start_options
             for method in --ovs-orig --ovs-ccache; do
                 lgen --ruleset $ruleset --locality $locality --ipg $ipg
             done
-            commit-ruleset $ruleset thr-zipf-$alpha
+            commit-ruleset $ruleset $name
         done
     done
 fi
@@ -372,15 +375,18 @@ if check-expr update; then
     rulesets="fw4-500k"
     initial=500
     start_options="--cores 2"
-    method="--ovs-cflows"
+    methods="--ovs-cflows"
+    delete="--do-not-delete"
+    instants="true false"
     emc_flag=""
     send-sut ./scripts/ovs-config.sh log-interval-ms 50
     for ruleset in $rulesets; do
-        for instant in true false; do
+        for instant in $instants; do
             send-sut ./scripts/ovs-config.sh instant-remainder $instant
+            for method in $methods; do
             for rate in 100; do
                 extra_options=instant-$instant-initial-$initial-rate-$rate
-                name=update-$extra_options
+                name=update-$method-$extra_options
                 if ! check-ruleset $ruleset $name; then
                     continue
                 fi
@@ -391,13 +397,17 @@ if check-expr update; then
                 lgen_manual_command="./scripts/ovs-rate.sh "
                 lgen_manual_command+="--ruleset $ruleset --rate $rate --interval 10000 "
                 lgen_manual_command+="--initial-delay 10 --initial-rules $initial "
-                lgen_manual_command+="--signal \$\$ --do-not-delete"
+                lgen_manual_command+="--signal \$\$ $delete"
 
                 load_options="--initial-rules $initial"
                 lgen_options_custom="t 2500"
                 # Initiate load generator
                 lgen --ruleset $ruleset --locality $locality --ipg $ipg
                 commit-ruleset $ruleset $name
+
+                # Stop rate on SUT
+                send-sut ./scripts/ovs-rate-stop.sh
+            done
             done
         done
     done

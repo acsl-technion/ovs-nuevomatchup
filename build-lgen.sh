@@ -1,11 +1,5 @@
 #!/bin/bash
 
-# Must run this as root
-[[ $EUID -ne 0 ]] && \
-    echo "Please run me as root." && \
-    exit 1
-
-
 my_dir=$(readlink -f $PWD)
 pgen_dir=$my_dir/simple-packet-gen
 devbind=$pgen_dir/dpdk/usertools/dpdk-devbind.py
