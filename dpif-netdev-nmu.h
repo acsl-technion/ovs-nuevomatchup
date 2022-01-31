@@ -1,5 +1,5 @@
-#ifndef OVS_NMU_H
-#define OVS_NUM_H 1
+#ifndef DPIF_NETDEV_NMU
+#define DPIF_NETDEV_NMU
 
 #include <stdbool.h>
 
@@ -49,11 +49,14 @@ void nmucls_lookup(struct nmucls *nmucls,
 void nmucls_print_rule_with_key(const struct nmucls *,
                                 const struct netdev_flow_key *key);
 
-void nmucls_print_stats(struct ds *reply, struct nmucls *nmucls);
+void nmucls_print_stats(struct ds *reply,
+                        struct nmucls *nmucls,
+                        const char *sep);
+void nmucls_clear_stats(struct nmucls *nmucls);
 
 void nmucls_rule_lock(struct nmucls *, struct dpcls_rule *);
 void nmucls_rule_unlock(struct nmucls *, struct dpcls_rule *);
 
 bool nmucls_rule_is_cmpflow(const struct dpcls_rule *);
 
-#endif // OVS_NMU_H
+#endif

@@ -29,12 +29,9 @@
 #include "openvswitch/util.h"
 #include "ovs-atomic.h"
 #include "ovs-thread.h"
-#include "simd.h"
 #include "smap.h"
 #include "util.h"
 #include "uuid.h"
-
-#define NUMBER_OF_FIELDS 5
 
 /* Ignore unused warnings in GCC when libnuevomatchup is missing */
 #ifndef __always_unused 
@@ -65,12 +62,12 @@
 
 /* Extract 'FIELD' from 'FLOW_P' and 'WILDCARD_P', then populate 'FIELD'
  * of 'CMPFLOW' with values of 'SIZE' bits */
-#define NMUCLS_EXTRACT_FIELD(FIELD, FLOW_P, WILDCARD_P, CMPFLOW, IDX, SIZE)    \
-do {                                                                          \
-    uint##SIZE##_t mask = NMUCLS_NTHBE_##SIZE(WILDCARD_P->masks.FIELD);        \
-    CMPFLOW.fields[IDX].low = NMUCLS_NTHBE_##SIZE(FLOW_P->FIELD) & mask;       \
-    CMPFLOW.fields[IDX].high = (CMPFLOW.fields[IDX].low | ~mask) &            \
-                               NMUCLS_BITMASK_##SIZE;                          \
+#define NMUCLS_EXTRACT_FIELD(FIELD, FLOW_P, WILDCARD_P, CMPFLOW, IDX, SIZE)  \
+do {                                                                         \
+    uint##SIZE##_t mask = NMUCLS_NTHBE_##SIZE(WILDCARD_P->masks.FIELD);      \
+    CMPFLOW.fields[IDX].low = NMUCLS_NTHBE_##SIZE(FLOW_P->FIELD) & mask;     \
+    CMPFLOW.fields[IDX].high = (CMPFLOW.fields[IDX].low | ~mask) &           \
+                               NMUCLS_BITMASK_##SIZE;                        \
 } while (0);
 
 VLOG_DEFINE_THIS_MODULE(dpif_netdev_nmu);
@@ -115,7 +112,7 @@ struct nmucls {
     long long int cmpflow_sync_time;
     long long int garbage_time;
     bool thread_running;
-    pthread_t trainer_thread;
+    pthread_t manager_thread;
     atomic_bool enabled;
 };
 
@@ -123,7 +120,7 @@ struct nmucls {
 #ifdef HAVE_NUEVOMATCHUP
 
 typedef uint64_t
-(*rule_match_func)(const struct iset_match* iset_match,
+(*rule_match_func)(const struct lnmu_iset_match* iset_match,
                    const struct netdev_flow_key *key);
 
 
@@ -180,7 +177,11 @@ static inline void nmu_lookup(struct nmucls *,
 static void nmu_init(struct nmucls *);
 static void nmu_destroy(struct nmucls *);
 
-static inline void nmu_print_stats(struct ds *reply, struct nmucls *nmucls);
+static inline void nmu_print_stats(struct ds *reply,
+                                   struct nmucls *nmucls,
+                                   const char *sep);
+static inline void nmu_clear_stats(struct nmucls *nmucls);
+
 static void nmu_rule_get_status(struct nmucls *,
                                 const struct dpcls_rule *rule,
                                 bool *in_nmu,
@@ -195,8 +196,8 @@ static inline uint32_t max_int(int a, int b);
 
 static int iset_entry_precedence_compare(const void *a, const void *b);
 static inline struct iset_match_impl *
-iset_match_get_impl(const struct iset_match *);
-static inline struct iset_impl * iset_get_impl(const struct iset *iset);
+iset_match_get_impl(const struct lnmu_iset_match *);
+static inline struct iset_impl * iset_get_impl(const struct lnmu_iset *iset);
 
 static void ptr_list_destroy(struct ovs_list *lst);
 static void ptr_list_push_ptr(struct ovs_list *lst, void *ptr);
@@ -211,7 +212,7 @@ static void rule_to_string(const struct nmucls *,
 
 static void nmu_rule_lock(struct nmucls *, const struct dpcls_rule *);
 static void nmu_rule_unlock(struct nmucls *, const struct dpcls_rule *);
-static int nmu_classifier_remove(struct nuevomatchup *nuevomatch,
+static int nmu_classifier_remove(struct lnmu_nuevomatchup *nuevomatch,
                                  const struct rule_info *rule_info);
 static void nmu_preprocess_rules(struct nmucls *nmucls);
 static void nmu_postprocess_rules(struct nmucls *nmucls);
@@ -231,6 +232,10 @@ nmu_extract_flow_fields(const struct netdev_flow_key** keys,
                         uint32_t *header_p);
 
 static struct cmpflow_item* cmpflow_lookup(struct nmucls *, uint64_t id);
+
+static void trainer_thread_ref(void);
+static int trainer_thread_unref(void);
+static bool trainer_thread_produce(struct nmucls *nmucls);
 
 #endif
 
@@ -375,7 +380,7 @@ nmucls_destroy(struct nmucls *nmucls)
     }
 #ifdef HAVE_NUEVOMATCHUP
     atomic_store(&nmucls->enabled, false);
-    xpthread_join(nmucls->trainer_thread, NULL);
+    xpthread_join(nmucls->manager_thread, NULL);
     nmu_destroy(nmucls);
     cmap_destroy(&nmucls->cmpflow_table);
     free(nmucls->nmt);
@@ -428,11 +433,20 @@ nmucls_print_rule_with_key(const struct nmucls __always_unused *nmucls,
 }
 
 void
-nmucls_print_stats(struct ds __always_unused *reply,
-                   struct nmucls __always_unused *nmucls)
+nmucls_print_stats(struct ds *reply,
+                   struct nmucls *nmucls,
+                   const char *sep)
 {
 #ifdef HAVE_NUEVOMATCHUP
-    nmu_print_stats(reply, nmucls);
+    nmu_print_stats(reply, nmucls, sep);
+#endif
+}
+
+void
+nmucls_clear_stats(struct nmucls __always_unused *nmucls)
+{
+#ifdef HAVE_NUEVOMATCHUP
+    nmu_clear_stats(nmucls); 
 #endif
 }
 
@@ -548,29 +562,29 @@ struct ptr_list {
 
 /* Used for fast switching between classifier versions using pointers */
 struct classifier_version {
-    struct nuevomatchup *nmu; /* NMU classifier */
+    struct lnmu_nuevomatchup *nmu; /* NMU classifier */
     void *rem;                /* Remainder, using cmpflows */
 };
 
 /* Necessary information and status on rules and flows */
 struct rule_info {
-    struct cmap_node node;          /* Within nmu_trainer */
+    struct cmap_node node;            /* Within nmu_trainer */
 
-    struct ovs_spin lock;           /* Prevent multiple writers */
+    struct ovs_spin lock;             /* Prevent multiple writers */
     struct cmpflow *cmpflow;          /* Pointer to cmpflow from netdev */
-    void *rule_p;                   /* Pointer to unique dpcls rule */
+    void *rule_p;                     /* Pointer to unique dpcls rule */
 
     bool in_lib;                      /* Held by libnuevomatchup */
     bool removed;                     /* Removed by a revalidator */
     bool delete_me;                   /* Marked for garbage collection */
     enum lnmu_inclusion_policy flags; /* Allow in iSet/Remainder/Both */
 
-    uint32_t hash;                  /* Hash for "rule_map" */
-    uint32_t lib_unique_id;         /* Unique id in libnuevomatchup */
-    int version;                    /* Classifier version */
-    int subset_idx;                 /* iSet index or -1 for remainder */
+    uint32_t hash;                    /* Hash for "rule_map" */
+    uint32_t lib_unique_id;           /* Unique id in libnuevomatchup */
+    int version;                      /* Classifier version */
+    int subset_idx;                   /* iSet index or -1 for remainder */
 
-    struct lnmu_flow flow;          /* 5-tuple flow for libnuevomatchup */
+    struct lnmu_flow flow;            /* 5-tuple flow for libnuevomatchup */
 };
 
 /* Items in nmucls->cmpflow_table */
@@ -727,7 +741,7 @@ netdev_flow_key_flatten(const struct netdev_flow_key *key,
 }
 
 static inline uint64_t ALWAYS_INLINE
-rule_match_impl(const struct iset_match* iset_match,
+rule_match_impl(const struct lnmu_iset_match* iset_match,
                 const struct netdev_flow_key *key,
                 const uint32_t bit_count_u0,
                 const uint32_t bit_count_u1)
@@ -764,7 +778,7 @@ rule_match_impl(const struct iset_match* iset_match,
 }
 
 static uint64_t
-rule_match_generic(const struct iset_match* iset_match,
+rule_match_generic(const struct lnmu_iset_match* iset_match,
                    const struct netdev_flow_key *key)
 {
     struct iset_match_impl *impl = iset_match_get_impl(iset_match);
@@ -778,7 +792,7 @@ rule_match_generic(const struct iset_match* iset_match,
 #define DECLARE_OPTIMIZED_LOOKUP_FUNCTION(U0, U1)                             \
     static uint64_t                                                           \
     rule_match__mf_u0w##U0##_u1w##U1(                                         \
-                                         const struct iset_match *iset_match, \
+                                         const struct lnmu_iset_match *iset_match, \
                                          const struct netdev_flow_key *key)   \
     {                                                                         \
         return rule_match_impl(iset_match, key, U0, U1);                      \
@@ -809,158 +823,29 @@ rule_match_probe(uint8_t u0_bits, uint8_t u1_bits)
     return f;
 }
 
-static bool
-submodel_valid(const struct submodel *smodel)
-{
-    float *c;
-    for (c=(float*)smodel; (char*)c < (char*)smodel+sizeof(smodel); ++c) {
-        if (isnan(*c)) {
-            return false;
-        }
-    }
-    return true;
-}
-
-static inline float ALWAYS_INLINE
-submodel_feed_forward(const struct submodel *smodel,
-                      float input)
-{
-#ifdef NO_SIMD
-    /* A simple implementation without intrinsics */
-    float result = 0;
-    for (int i=0; i<SUBMODEL_WIDTH; ++i) {
-        result += max_float(0.0f, input*smodel->w1[i]+smodel->b1[i]) *
-                  smodel->w2[i];
-    }
-    result += smodel->b2;
-    return result;
-#endif
-
-    float output;
-    PS_REG zeros = SIMD_ZEROS_PS;
-    PS_REG result = SIMD_SET1_PS(input);
-
-    PS_REG w1 = SIMD_LOADU_PS(smodel->w1);
-    PS_REG b1 = SIMD_LOADU_PS(smodel->b1);
-    PS_REG w2 = SIMD_LOADU_PS(smodel->w2);
-
-    /* AVX and AVX512 are fine with that */
-    SIMD_FMA_PS(result, w1, b1);
-    SIMD_MAX_PS(result, result, zeros);
-    result = SIMD_MUL_PS(result, w2);
-    SIMD_REDUCE_SUM_PS(output, result);
-
-    /* SSE Should perform more calculations */
-#if (__SSE__) && (!__AVX__)
-    PS_REG result_4 = SIMD_SET1_PS(input);
-    PS_REG w1_4 = SIMD_LOADU_PS(smodel->w1+4);
-    PS_REG b1_4 = SIMD_LOADU_PS(smodel->b1+4);
-    PS_REG w2_4 = SIMD_LOADU_PS(smodel->w2+4);
-
-    float output_4;
-    SIMD_FMA_PS(result_4, w1_4, b1_4);
-    SIMD_MAX_PS(result_4, result_4, zeros);
-    result_4 = SIMD_MUL_PS(result_4, w2_4);
-    SIMD_REDUCE_SUM_PS(output_4, result_4);
-    output += output_4;
-#endif
-
-    output += smodel->b2;
-    return output;
-}
-
-static bool
-rqrmi_valid(const struct rqrmi *rqrmi)
-{
-    int num;
-
-    num = 0;
-    for (int i=0; i<rqrmi->num_of_stages; ++i) {
-        num += rqrmi->widths[i];
-    }
-
-    for (int i=0; i<num; ++i) {
-        if (!submodel_valid(&rqrmi->submodels[i])) {
-            return false;
-        }
-    }
-
-    return true;
-}
-
-static inline void ALWAYS_INLINE
-rqrmi_inference(const struct rqrmi *rqrmi,
-                const simd_vector_t *input,
-                simd_vector_t *output,
-                simd_vector_t *errors,
-                const int batch_size)
-{
-    int base_idx;
-    struct submodel *smodel;
-    float current_input;
-    int submodel_indices[batch_size];
-
-    /* Set ones and zeros */
-    PS_REG zeros = SIMD_ZEROS_PS;
-    PS_REG ones = SIMD_SET1_PS(1-FLT_EPSILON);
-
-    /* Intermediate results. Starts with 0 */
-    for (int j=0; j<batch_size; ++j) {
-        output->scalars[j] = 0;
-    }
-
-    base_idx = 0;
-
-    /* Go over all stages */
-    for (size_t i=0; i<rqrmi->num_of_stages; ++i) {
-        /* For each input in batch */
-        for (int j=0; j<batch_size; ++j) {
-            /* Get the submodel */
-            submodel_indices[j] = floor(rqrmi->widths[i] * output->scalars[j]);
-            smodel = &rqrmi->submodels[base_idx + submodel_indices[j]];
-            /* Perform input normalization */
-            current_input = (input->scalars[j] - smodel->in_mean) /
-                            smodel->in_stddev;
-            /* Perform inference */
-            output->scalars[j] = submodel_feed_forward(smodel, current_input);
-        }
-        /* Perform saturation over all outputs */
-        PS_REG imm = SIMD_LOADU_PS(output->scalars);
-        SIMD_MIN_PS(imm, imm, ones);
-        SIMD_MAX_PS(imm, imm, zeros);
-        SIMD_STORE_PS(output->scalars, imm);
-        /* Update base index */
-        base_idx += rqrmi->widths[i];
-    }
-    /* Set the errors */
-    for (int i=0; i<batch_size; ++i) {
-        errors->integers[i] = rqrmi->errors[submodel_indices[i]];
-    }
-}
-
 static inline struct iset_match_impl *
-iset_match_get_impl(const struct iset_match *iset_match)
+iset_match_get_impl(const struct lnmu_iset_match *iset_match)
 {
     return CONST_CAST(struct iset_match_impl*, iset_match->data);
 }
 
 static inline struct iset_impl *
-iset_get_impl(const struct iset *iset)
+iset_get_impl(const struct lnmu_iset *iset)
 {
     return CONST_CAST(struct iset_impl*, iset->args);
 }
 
 static void
-iset_match_invalidate(struct iset *iset, int entry_idx, int rule_idx)
+iset_match_invalidate(struct lnmu_iset *iset, int entry_idx, int rule_idx)
 {
-    struct iset_match *iset_match;
+    struct lnmu_iset_match *iset_match;
     size_t db_entry, val_entry;
     uint32_t *val_matrix;
     int *entry_rules;
     int offset;
 
     db_entry = iset->row_size * entry_idx;
-    val_entry = db_entry*2*NUMBER_OF_FIELDS;
+    val_entry = db_entry*2*LNMU_FIELD_NUM;
 
     iset_match = &iset->match_db[db_entry];
     entry_rules = &iset->entry_rules[entry_idx];
@@ -975,7 +860,7 @@ iset_match_invalidate(struct iset *iset, int entry_idx, int rule_idx)
     free(iset_match[rule_idx].data);
     iset_match[rule_idx].data = NULL;
 
-    for (int k=0; k<NUMBER_OF_FIELDS; ++k) {
+    for (int k=0; k<LNMU_FIELD_NUM; ++k) {
         offset = k*iset->row_size;
         val_matrix[rule_idx+offset] = 0xFFFFFFFF;
         val_matrix[rule_idx+offset+iset->hi_values] = 0;
@@ -983,17 +868,17 @@ iset_match_invalidate(struct iset *iset, int entry_idx, int rule_idx)
 }
 
 static void
-iset_entry_sort_by_priority(struct iset *iset, int entry_idx)
+iset_entry_sort_by_priority(struct lnmu_iset *iset, int entry_idx)
 {
     struct iset_match_impl *iset_match_impl;
     struct iset_entry_precedence *elements;
-    struct iset_match *iset_match, *iset_match_cpy;
+    struct lnmu_iset_match *iset_match, *iset_match_cpy;
     uint32_t *val_matrix, *val_matrix_cpy;
     size_t db_entry, val_entry;
     int idx, offset;
 
     const int mat_rows = iset->row_size;
-    const int mat_cols = 2*NUMBER_OF_FIELDS;
+    const int mat_cols = 2*LNMU_FIELD_NUM;
 
     db_entry = mat_rows*entry_idx;
     val_entry = mat_rows*mat_cols*entry_idx;
@@ -1034,12 +919,12 @@ iset_entry_sort_by_priority(struct iset *iset, int entry_idx)
 
 
 static inline void
-iset_init(struct iset *iset)
+iset_init(struct lnmu_iset *iset)
 {
     struct iset_match_impl *iset_match_impl;
     struct iset_rule_info *iset_rule_info;
     struct rule_info *rule_info;
-    struct iset_match *iset_match;
+    struct lnmu_iset_match *iset_match;
     struct dpcls_rule *rule_p;
     struct cmpflow *cmpflow;
 
@@ -1121,7 +1006,7 @@ iset_init(struct iset *iset)
 }
 
 static inline void
-iset_destroy(struct nmucls *nmucls, struct iset *iset)
+iset_destroy(struct nmucls *nmucls, struct lnmu_iset *iset)
 {
     struct iset_rule_info *item;
 
@@ -1146,11 +1031,11 @@ iset_destroy(struct nmucls *nmucls, struct iset *iset)
 }
 
 static inline void ALWAYS_INLINE
-iset_secondary_search(struct iset *iset,
-                      const simd_vector_t *rqrmi_inputs,
-                      simd_vector_t *rqrmi_outputs,
-                      simd_vector_t *rqrmi_errors,
-                      simd_vector_t *results,
+iset_secondary_search(struct lnmu_iset *iset,
+                      const float *rqrmi_inputs,
+                      const float *rqrmi_outputs,
+                      const int *rqrmi_errors,
+                      int *results,
                       uint32_t *keys_map,
                       int packet_idx,
                       const int batch_size)
@@ -1172,10 +1057,10 @@ iset_secondary_search(struct iset *iset,
         if (!ULLONG_GET(*keys_map, packet_idx+k)) {
             continue;
         }
-        position[k] = rqrmi_outputs->scalars[k] * size;
-        u_bound[k] = min_uint(size-1, position[k]+rqrmi_errors->integers[k]);
-        l_bound[k] = max_int(0, (int)position[k]-rqrmi_errors->integers[k]);
-        max_error = max_uint(rqrmi_errors->integers[k], max_error);
+        position[k] = rqrmi_outputs[k] * size;
+        u_bound[k] = min_uint(size-1, position[k]+rqrmi_errors[k]);
+        l_bound[k] = max_int(0, (int)position[k]-rqrmi_errors[k]);
+        max_error = max_uint(rqrmi_errors[k], max_error);
     }
 
     /* Binary search, use memory parallelization over batch size */
@@ -1187,10 +1072,8 @@ iset_secondary_search(struct iset *iset,
             if (!ULLONG_GET(*keys_map, packet_idx+k)) {
                 continue;
             }
-            low_bound_valid[k] = iset->value_db[position[k]] <=
-                                 rqrmi_inputs->scalars[k];
-            high_bound_valid[k] = iset->value_db[position[k]+1] >
-                                  rqrmi_inputs->scalars[k];
+            low_bound_valid[k]=iset->value_db[position[k]]<=rqrmi_inputs[k];
+            high_bound_valid[k]=iset->value_db[position[k]+1]>rqrmi_inputs[k];
         }
         /* Calculate the next position per packet in batch */
         for (int k=0; k<batch_size; ++k) {
@@ -1215,124 +1098,52 @@ iset_secondary_search(struct iset *iset,
     }
 
     for (int k=0; k<batch_size; ++k) {
-        results->integers[k] = position[k];
+        results[k] = position[k];
     }
 }
 
-static inline int ALWAYS_INLINE
-iset_entry_validation(const struct netdev_flow_key *key,
-                      struct dpcls_rule **result,
-                      int *current_priority,
-                      int entry_index,
-                      const uint32_t *header_p,
-                      struct iset *iset)
+struct validation_callback_args {
+    const struct netdev_flow_key *key;
+    struct dpcls_rule **result;
+    int *current_priority;
+};
 
+static int
+entry_validation_callback(const struct lnmu_iset_match *iset_match,
+                          void *args)
 {
-    const struct iset_match *iset_match;
-    const struct iset_match *current_match;
+    struct validation_callback_args *a=(struct validation_callback_args*)args;
     const struct iset_match_impl *iset_match_impl;
-    size_t db_entry, val_entry;
-    const uint32_t *val_matrix;
     rule_match_func match_func;
-    int validation_count;
-    int collision_position;
-    int entry_offset;
-    const uint32_t *cursor_lo, *cursor_hi;
-    uint32_t element;
 
-    db_entry = iset->row_size * entry_index;
-    val_entry = db_entry * (2 * NUMBER_OF_FIELDS);
-    validation_count = 0;
-    collision_position = -SIMD_WIDTH;
+    iset_match_impl = iset_match_get_impl(iset_match);
 
-    /* Get pointers to all arrays */
-    iset_match = &iset->match_db[db_entry];
-    val_matrix = &iset->validation_db[val_entry];
-
-    /* Get the first and only rule that matches the iSet field */
-    for (int i=0; i<iset->iterations; ++i) {
-        /* Update the base collision position */
-        collision_position += SIMD_WIDTH;
-
-        EPU_REG indices = SIMD_SET_EPI32(8,7,6,5,4,3,2,1);
-        PS_REG indices_ps = SIMD_CASTSI_PS(indices);
-
-        /* Calibrate base pointers to point to fields low & high values */
-        cursor_lo = &val_matrix[collision_position];
-        cursor_hi = &val_matrix[collision_position + iset->hi_values];
-
-        /* For each field (row in validation matrix) */
-        for (int f=0; f<NUMBER_OF_FIELDS; ++f) {
-            EPU_REG header = SIMD_SET1_EPI(header_p[f]);
-            EPU_REG vector_lo = SIMD_LOADU_SI(cursor_lo);
-            EPU_REG vector_hi = SIMD_LOADU_SI(cursor_hi);
-            /* Which one is higher? */
-            EPU_REG result_lo, result_hi;
-            SIMD_MAX_EPU32(result_lo, header, vector_lo);
-            SIMD_MAX_EPU32(result_hi, header, vector_hi);
-            /* Low bound we wish header >= vector_lo
-             * High bound we wish vector_hi >= header */
-            SIMD_CMPEQ_EPI32(result_lo, result_lo, header);
-            SIMD_CMPEQ_EPI32(result_hi, result_hi, vector_hi);
-            /* Result now hold scalars which are 0x00000000 (not good)
-             * or 0xffffffff (good). We wish results that are valid
-             * in both low and high */
-            PS_REG result_lo_ps = SIMD_CASTSI_PS(result_lo);
-            PS_REG result_hi_ps = SIMD_CASTSI_PS(result_hi);
-            PS_REG result_both_ps = SIMD_AND_PS(result_lo_ps, result_hi_ps);
-            /* Perform AND between the current results and the indices */
-            indices_ps = SIMD_AND_PS(indices_ps, result_both_ps);
-            /* Update to next field */
-            cursor_lo += iset->row_size;
-            cursor_hi += iset->row_size;
-        }
-
-        /* Go over all integers in "indices_ps" */
-        indices = SIMD_CASTPS_SI(indices_ps);
-        SIMD_FOREACH_EPU32(indices, element) {
-            if (!element) {
-                continue;
-            }
-
-            entry_offset = element + collision_position - 1;
-            current_match = &iset_match[entry_offset];
-            iset_match_impl = iset_match_get_impl(current_match);
-            validation_count++;
-
-            /* The rule was removed */
-            if (!current_match->match) {
-                continue;
-            }
-
-            /* We can't possibly find another match, as priorities descend */
-            if (*current_priority > iset_match_impl->priority) {
-                goto finish;
-            }
-
-            match_func = (rule_match_func)iset_match_impl->match_func;
-
-            /* Validate that the rule matches */
-            if (match_func(current_match, key)) {
-                *result = current_match->match;
-                *current_priority = iset_match_impl->priority;
-                /* We stop on the first rule we encounter, either if
-                 * they do not overlap (megaflows) or they do overlap with
-                 * priorities (ordered by priority) */
-                goto finish;
-            }
-        }
+    /* We can't possibly find another match, as priorities descend */
+    if (*a->current_priority > iset_match_impl->priority) {
+        return 1;
     }
 
-finish:
-    return validation_count;
+    match_func = (rule_match_func)iset_match_impl->match_func;
+
+    /* Validate that the rule matches */
+    if (match_func(iset_match, a->key)) {
+        *a->result = iset_match->match;
+        *a->current_priority = iset_match_impl->priority;
+        /* We stop on the first rule we encounter, either if
+         * they do not overlap (megaflows) or they do overlap with
+         * priorities (ordered by priority) */
+        return 1;
+    }
+
+    return 0;
 }
 
 static inline void ALWAYS_INLINE
 iset_validation_phase(const struct netdev_flow_key **keys,
                       const int packet_idx,
-                      struct iset *iset,
+                      struct lnmu_iset *iset,
                       const uint32_t *header_p,
-                      const simd_vector_t *search_results,
+                      const int *search_results,
                       struct dpcls_rule **results,
                       int *priorities,
                       double *avg_matches_p,
@@ -1340,6 +1151,7 @@ iset_validation_phase(const struct netdev_flow_key **keys,
                       uint32_t *keys_map,
                       const int batch_size)
 {
+    struct validation_callback_args vca;
     int entry_index;
     int validation_count;
     int base;
@@ -1351,18 +1163,20 @@ iset_validation_phase(const struct netdev_flow_key **keys,
             continue;
         }
 
-        entry_index = search_results->integers[k];
+        entry_index = search_results[k];
+        vca.key = keys[packet_idx+k];
+        vca.result = &results[packet_idx+k];
+        vca.current_priority = &priorities[packet_idx+k];
 
+        validation_count = lnmu_iset_entry_validation(iset,
+                                               header_p,
+                                               entry_index,
+                                               entry_validation_callback,
+                                               &vca);
 
-        validation_count = iset_entry_validation(keys[packet_idx+k],
-                                                 &results[packet_idx+k],
-                                                 &priorities[packet_idx+k],
-                                                 entry_index,
-                                                 &header_p[base],
-                                                 iset);
         /* Used for statistics */
         *num_validations_p += validation_count;
-        base += NUMBER_OF_FIELDS;
+        base += LNMU_FIELD_NUM;
 
         /* Updates statistics, mark packet as resolved */
         if (results[packet_idx+k]) {
@@ -1373,7 +1187,7 @@ iset_validation_phase(const struct netdev_flow_key **keys,
 }
 
 static struct iset_rule_info*
-iset_find_item(struct iset *iset,
+iset_find_item(struct lnmu_iset *iset,
                const struct rule_info *rule_info)
 {
     struct iset_rule_info *item_node;
@@ -1391,11 +1205,11 @@ iset_find_item(struct iset *iset,
 }
 
 static int
-iset_invalidate(struct iset *iset,
+iset_invalidate(struct lnmu_iset *iset,
                 const struct rule_info *rule_info)
 {
     struct iset_rule_info *iset_rule_info;
-    struct iset_match *iset_match;
+    struct lnmu_iset_match *iset_match;
     int entry_idx;
     int *entry_rules;
     size_t db_entry;
@@ -1436,15 +1250,15 @@ iset_lookup_batch__(struct nmu_trainer *nmt,
                     const struct netdev_flow_key **keys,
                     uint32_t *keys_map,
                     const int packet_idx,
-                    struct iset *iset,
-                    struct rqrmi *rqrmi,
+                    struct lnmu_iset *iset,
+                    struct lnmu_rqrmi *rqrmi,
                     const uint32_t *header_p,
                     struct dpcls_rule **results,
                     int *priorities,
-                    simd_vector_t *rqrmi_inputs,
-                    simd_vector_t *rqrmi_outputs,
-                    simd_vector_t *rqrmi_errors,
-                    simd_vector_t *search_results,
+                    float *rqrmi_inputs,
+                    float *rqrmi_outputs,
+                    int *rqrmi_errors,
+                    int *search_results,
                     const int batch_size)
 {
 
@@ -1452,14 +1266,14 @@ iset_lookup_batch__(struct nmu_trainer *nmt,
 
     /* Set inputs */
     for (int i=0; i<batch_size; ++i) {
-        rqrmi_inputs->scalars[i] = header_p[base + iset->field_idx];
-        base += NUMBER_OF_FIELDS;
+        rqrmi_inputs[i] = header_p[base + iset->field_idx];
+        base += LNMU_FIELD_NUM;
     }
 
     /* 3 Phases */
     PERF_START(inference_timer_ns);
-    rqrmi_inference(rqrmi, rqrmi_inputs, rqrmi_outputs,
-                    rqrmi_errors, batch_size);
+    lnmu_rqrmi_inference(rqrmi, rqrmi_inputs, rqrmi_outputs,
+                         rqrmi_errors, batch_size);
     PERF_END(inference_timer_ns);
 
     PERF_START(search_timer_ns);
@@ -1489,17 +1303,21 @@ iset_lookup_batch(struct nmu_trainer *nmt,
                   const struct netdev_flow_key **keys,
                   uint32_t *keys_map,
                   const int packet_idx,
-                  struct iset *iset,
-                  struct rqrmi *rqrmi,
+                  struct lnmu_iset *iset,
+                  struct lnmu_rqrmi *rqrmi,
                   const uint32_t *header_p,
                   struct dpcls_rule **results,
                   int *priorities,
                   const int count)
 {
-    simd_vector_t rqrmi_inputs, rqrmi_outputs, rqrmi_errors, search_results;
+    float rqrmi_inputs[LNMU_RQRMI_BATCH_SIZE];
+    float rqrmi_outputs[LNMU_RQRMI_BATCH_SIZE];
+    int rqrmi_errors[LNMU_RQRMI_BATCH_SIZE];
+    int search_results[LNMU_RQRMI_BATCH_SIZE];
+
     iset_lookup_batch__(nmt, keys, keys_map, packet_idx, iset,
-            rqrmi, header_p, results, priorities, &rqrmi_inputs, &rqrmi_outputs,
-            &rqrmi_errors, &search_results, count);
+          rqrmi, header_p, results, priorities, rqrmi_inputs, rqrmi_outputs,
+          rqrmi_errors, search_results, count);
 }
 
 static void
@@ -1509,7 +1327,11 @@ iset_lookup_debug_print(const struct nmucls *nmucls,
                         int iset_idx)
 
 {
-    simd_vector_t rqrmi_inputs, rqrmi_outputs, rqrmi_errors, search_results;
+    float rqrmi_inputs[LNMU_RQRMI_BATCH_SIZE];
+    float rqrmi_outputs[LNMU_RQRMI_BATCH_SIZE];
+    int rqrmi_errors[LNMU_RQRMI_BATCH_SIZE];
+    int search_results[LNMU_RQRMI_BATCH_SIZE];
+    struct validation_callback_args vca;
     struct dpcls_rule *result;
     int priority;
     int entry_index;
@@ -1519,8 +1341,8 @@ iset_lookup_debug_print(const struct nmucls *nmucls,
     bool bound_found;
     int validation_count;
     uint32_t keys_map;
-    struct iset *iset;
-    struct rqrmi *rqrmi;
+    struct lnmu_iset *iset;
+    struct lnmu_rqrmi *rqrmi;
     struct rule_info *info;
     struct ds str;
 
@@ -1532,23 +1354,26 @@ iset_lookup_debug_print(const struct nmucls *nmucls,
     keys_map = 1;
 
     iset_lookup_batch__(nmucls->nmt, &key, &keys_map, 0, iset,
-            rqrmi, header_p, &result, &priority, &rqrmi_inputs, &rqrmi_outputs,
-            &rqrmi_errors, &search_results, 1);
+            rqrmi, header_p, &result, &priority, rqrmi_inputs, rqrmi_outputs,
+            rqrmi_errors, search_results, 1);
 
-    entry_index = search_results.integers[0];
-    rqrmi_input = rqrmi_inputs.scalars[0];
+    entry_index = search_results[0];
+    rqrmi_input = rqrmi_inputs[0];
     entry_left = iset->value_db[entry_index];
     entry_right = (entry_index == iset->num_of_entries -1) ?
                    0xffffffff : iset->value_db[entry_index+1];
     search_found = (rqrmi_input >= entry_left) &&
                    (rqrmi_input <= entry_right);
 
-    validation_count = iset_entry_validation(key,
-                                             &result,
-                                             &priority,
-                                             entry_index,
-                                             header_p,
-                                             iset);
+    vca.key = key;
+    vca.result = &result;
+    vca.current_priority = &priority;
+
+    validation_count = lnmu_iset_entry_validation(iset,
+                                               header_p,
+                                               entry_index,
+                                               entry_validation_callback,
+                                               &vca);
 
     bound_found = validation_count>0;
 
@@ -1570,9 +1395,9 @@ iset_lookup_debug_print(const struct nmucls *nmucls,
                       "entry-start: %u, rqrmi-error: %d "
                       "entry-index: %d, entry-bounds: [%u,%u], ",
                       iset->field_idx,
-                      (uint32_t)(rqrmi_outputs.scalars[0] *
+                      (uint32_t)(rqrmi_outputs[0] *
                                  iset->num_of_entries),
-                      rqrmi_errors.integers[0],
+                      rqrmi_errors[0],
                       entry_index,
                       entry_left,
                       entry_right);
@@ -1626,8 +1451,8 @@ rule_info_unlock(struct rule_info *info)
 static void
 rule_info_remove(struct nmucls *nmucls, struct rule_info *info)
 {
-    struct nuevomatchup *active;
-    struct nuevomatchup *shadow;
+    struct lnmu_nuevomatchup *active;
+    struct lnmu_nuevomatchup *shadow;
     int shadow_valid;
     struct nmu_trainer *nmt;
 
@@ -1674,19 +1499,20 @@ remainder_classify(struct nmucls *nmucls,
                    struct dpcls_rule **result)
 {
     struct iset_match_impl iset_match_impl;
-    struct iset_match iset_match;
+    struct lnmu_iset_match iset_match;
     struct rule_info *rule_info;
     struct lnmu_trainer *lib;
     struct cmpflow *cmpflow;
     void *rule_p;
     int error;
+    uint32_t id;
 
     rule_info = NULL;
     rule_p = *result;
     lib = &nmucls->nmt->trainer;
     ovs_spin_lock(&nmucls->nmt->remainder_lock);
     error = lnmu_remainder_classify(lib, nmucls->nmt->active->rem,
-                                             header, priority,
+                                             header, &id, priority,
                                              &rule_p, (void**)&rule_info);
     ovs_spin_unlock(&nmucls->nmt->remainder_lock);
 
@@ -1717,7 +1543,7 @@ remainder_classify(struct nmucls *nmucls,
 
 
 static bool
-nmu_classifier_init(struct nuevomatchup *nuevomatch)
+nmu_classifier_init(struct lnmu_nuevomatchup *nuevomatch)
 {
     if (!nuevomatch) {
         return true;
@@ -1728,7 +1554,7 @@ nmu_classifier_init(struct nuevomatchup *nuevomatch)
         iset_init(nuevomatch->iset[i]);
 
         /* Make sure RQ-RMI is valid */
-        if (!rqrmi_valid(nuevomatch->rqrmi[i])) {
+        if (!lnmu_rqrmi_valid(nuevomatch->rqrmi[i])) {
             return false;
         }
     }
@@ -1737,7 +1563,7 @@ nmu_classifier_init(struct nuevomatchup *nuevomatch)
 
 static void
 nmu_classifier_destroy(struct nmucls *nmucls,
-                       struct nuevomatchup **nuevomatch)
+                       struct lnmu_nuevomatchup **nuevomatch)
 {
     /* Must be called in RCU grace period */
     if (!nuevomatch || !*nuevomatch) {
@@ -1756,7 +1582,7 @@ nmu_classifier_destroy(struct nmucls *nmucls,
 }
 
 static int
-nmu_classifier_remove(struct nuevomatchup *nuevomatch,
+nmu_classifier_remove(struct lnmu_nuevomatchup *nuevomatch,
                       const struct rule_info *rule_info)
 {
     int result;
@@ -1786,10 +1612,10 @@ rule_to_string(const struct nmucls *nmucls,
                struct ds *str)
 {
     struct iset_rule_info *iset_rule_info;
-    struct nuevomatchup *nuevomatch;
-    struct iset_match *iset_match;
+    struct lnmu_nuevomatchup *nuevomatch;
+    struct lnmu_iset_match *iset_match;
     struct cmap *iset_map;
-    struct iset *iset;
+    struct lnmu_iset *iset;
     int subset_idx;
     int row_size;
     int entry_idx, entry_pos;
@@ -1845,7 +1671,7 @@ rule_to_string(const struct nmucls *nmucls,
         entry_idx = iset_rule_info->entry_idx;
         entry_pos = -1;
         db_entry = iset->row_size * entry_idx;
-        val_entry = db_entry * 2 * NUMBER_OF_FIELDS;
+        val_entry = db_entry * 2 * LNMU_FIELD_NUM;
         mat = &iset->validation_db[val_entry];
         entry_left = iset->value_db[entry_idx];
         entry_rules = iset->entry_rules[entry_idx];
@@ -1873,10 +1699,10 @@ rule_to_string(const struct nmucls *nmucls,
                           entry_left, entry_right);
         } else {
             ds_put_cstr(str, "match-boundaries: [");
-            for (int f=0; f<NUMBER_OF_FIELDS*2; ++f) {
+            for (int f=0; f<LNMU_FIELD_NUM*2; ++f) {
                 ds_put_format(str, "%u%s",
                               match_column[f*iset->row_size],
-                              (f < NUMBER_OF_FIELDS*2-1) ? ", " : "]");
+                              (f < LNMU_FIELD_NUM*2-1) ? ", " : "]");
             }
         }
         break;
@@ -1973,10 +1799,10 @@ nmu_debug_print(const struct nmucls *nmucls,
 {
     struct dpcls_rule *rule;
     struct rule_info *info;
-    struct iset_match iset_match;
+    struct lnmu_iset_match iset_match;
     struct iset_match_impl iset_match_impl;
-    uint32_t header_fields[NUMBER_OF_FIELDS];
-    struct nuevomatchup *nuevomatch;
+    uint32_t header_fields[LNMU_FIELD_NUM];
+    struct lnmu_nuevomatchup *nuevomatch;
     struct nmu_trainer *nmt;
     struct ds str;
     bool found;
@@ -2037,10 +1863,10 @@ nmu_debug_print(const struct nmucls *nmucls,
             nmu_extract_flow_fields(&key, 1, header_fields);
             ds_clear(&str);
             ds_put_cstr(&str, "[");
-            for (int f=0; f<NUMBER_OF_FIELDS; ++f) {
+            for (int f=0; f<LNMU_FIELD_NUM; ++f) {
                 ds_put_format(&str, "%u%s",
                               header_fields[f],
-                              (f==NUMBER_OF_FIELDS-1) ? "]" : ", ");
+                              (f==LNMU_FIELD_NUM-1) ? "]" : ", ");
             }
             VLOG_INFO("iSet %ld extracted fields: %s", i, ds_cstr(&str));
             iset_lookup_debug_print(nmucls, key, header_fields, i);
@@ -2064,7 +1890,7 @@ nmu_extract_flow_fields(const struct netdev_flow_key** keys,
 
     for (int i=0; i<count; ++i) {
         mf = &keys[i]->mf;
-        base = i * NUMBER_OF_FIELDS;
+        base = i * LNMU_FIELD_NUM;
         header_p[base+0] = NMUCLS_NTHBE_8(MINIFLOW_GET_U8(mf, nw_proto));
         header_p[base+1] = NMUCLS_NTHBE_32(MINIFLOW_GET_U32(mf, nw_src));
         header_p[base+2] = NMUCLS_NTHBE_32(MINIFLOW_GET_U32(mf, nw_dst));
@@ -2082,9 +1908,9 @@ nmu_lookup(struct nmucls *nmucls,
            const int count,
            struct dpcls_rule **results)
 {
-    uint32_t header_fields[count*NUMBER_OF_FIELDS];
+    uint32_t header_fields[count*LNMU_FIELD_NUM];
     int priorities[count];
-    struct nuevomatchup *nuevomatch;
+    struct lnmu_nuevomatchup *nuevomatch;
     struct nmu_trainer *nmt;
     uint32_t found_map;
     uint32_t iset_key_map;
@@ -2100,7 +1926,7 @@ nmu_lookup(struct nmucls *nmucls,
     memset(priorities, 0xFF, sizeof(priorities)); /* Initiate all as -1 */
 
     /* Optimization for single packet */
-    batch_size = (count == 1) ? 1 : SIMD_WIDTH;
+    batch_size = (count == 1) ? 1 : LNMU_RQRMI_BATCH_SIZE;
     iset_key_map = *keys_map;
     found_map = iset_key_map;
 
@@ -2116,14 +1942,14 @@ nmu_lookup(struct nmucls *nmucls,
     }
 
     for (i=0; i<nuevomatch->num_of_isets; ++i) {
-        for (size_t p=0; p<count; p+=SIMD_WIDTH) {
+        for (size_t p=0; p<count; p+=LNMU_RQRMI_BATCH_SIZE) {
             iset_lookup_batch(nmt,
                     keys,
                     &iset_key_map,
                     p,
                     nuevomatch->iset[i],
                     nuevomatch->rqrmi[i],
-                    &header_fields[p*NUMBER_OF_FIELDS],
+                    &header_fields[p*LNMU_FIELD_NUM],
                     results,
                     priorities,
                     batch_size);
@@ -2145,7 +1971,7 @@ after_isets:
         ULLONG_FOR_EACH_1(i, iset_key_map) {
             res = remainder_classify(nmucls,
                                      keys[i],
-                                     &header_fields[i*NUMBER_OF_FIELDS],
+                                     &header_fields[i*LNMU_FIELD_NUM],
                                      &priorities[i],
                                      &results[i]);
             if (res) {
@@ -2175,11 +2001,8 @@ nmu_init(struct nmucls *nmucls)
     /* The order and types of "libconfig" members differ from
      * these of "config" */
     libconfig.max_collision = config->max_collision;
-    libconfig.max_retraining_sessions = config->max_retrain_sessions;
     libconfig.error_threshold = config->error_threshold;
-    libconfig.samples_per_session = config->samples_per_session;
     libconfig.minimal_coverage = config->minimal_coverage;
-    libconfig.use_batching = config->use_batching;
 
     if (lnmu_init(&nmt->trainer, &libconfig)) {
         VLOG_ERR("%s", nmt->trainer.error);
@@ -2268,6 +2091,7 @@ nmu_insert(struct nmucls *nmucls,
 {
     struct rule_info *info, *node;
     struct nmu_trainer *nmt;
+    bool insert_to_remainder;
 
     info = xmalloc(sizeof *info);
     info->removed = false;
@@ -2302,8 +2126,11 @@ nmu_insert(struct nmucls *nmucls,
     nmt->num_of_total_rules_out++;
     nmt->updates = true;
 
-    /* In case of cmpflows, insert the rule now to active remainder */
-    if (nmt->instant_remainder && nmu_cmpflow_enabled(nmucls)) {
+    /* In case of cmpflows, and instant remainder (or priority zero),
+     * insert the rule now to active remainder */
+    insert_to_remainder = (nmt->instant_remainder) ||
+                          (cmpflow->priority == 0);
+    if (nmu_cmpflow_enabled(nmucls) && insert_to_remainder) {
         ovs_spin_lock(&nmt->remainder_lock);
         int error = lnmu_insert(&nmt->trainer, &info->flow,
                                          nmt->active->rem,
@@ -2314,8 +2141,7 @@ nmu_insert(struct nmucls *nmucls,
             VLOG_WARN("%s", nmt->trainer.error);
         }
         info->in_lib = true;
-        info->flags = LNMU_INCLUSION_ALLOW_IN_ISET |
-                      LNMU_INCLUSION_ALLOW_IN_REMAINDER;
+        info->flags |= LNMU_INCLUSION_ALLOW_IN_REMAINDER;
         nmt->updates = true;
     }
 
@@ -2445,7 +2271,7 @@ nmu_preprocess_rules(struct nmucls *nmucls)
         }
         /* In case the rule is in library and was removed, remove it */
         else if ( (info->in_lib) && (info->removed) ) {
-            lnmu_remove(lnm, info->lib_unique_id);
+            lnmu_remove(lnm, info->lib_unique_id, NULL);
             ovs_assert(!lnmu_contains(lnm, info->lib_unique_id));
             info->in_lib = false;
             nmt->updates = true;
@@ -2882,35 +2708,47 @@ nmucls_remove__(struct nmucls *nmucls,
 }
 
 static inline void
-nmu_print_stats(struct ds *reply, struct nmucls *nmucls)
+nmu_clear_stats(struct nmucls *nmucls)
 {
-   if (!nmucls_enabled(nmucls)) {
-       return;
-   }
-   const struct nmu_statistics *nmu_stats = &nmucls->nmt->stats;
+    if (!nmucls_enabled(nmucls)) {
+        return;
+    }
+    memset(&nmucls->nmt->stats, 0, sizeof(struct nmu_statistics));
+}
+ 
+static inline void
+nmu_print_stats(struct ds *reply, struct nmucls *nmucls, const char *sep)
+{
+    if (!nmucls_enabled(nmucls)) {
+        return;
+    }
+    const struct nmu_statistics *nmu_stats = &nmucls->nmt->stats;
+ 
+    double total_packets = nmu_stats->total_packets ?
+                           nmu_stats->total_packets : 1;
+    double validations = nmu_stats->num_validations ?
+                         nmu_stats->num_validations : 1;
+    double hit_rate = nmu_stats->hit_count / total_packets;
+    double parsing_ns = nmu_stats->parsing_ns / total_packets;
+    double remainder_ns = nmu_stats->remainder_ns / total_packets;
+    double inference_ns = nmu_stats->inference_ns / total_packets;
+    double search_ns = nmu_stats->search_ns / total_packets;
+    double validation_ns = nmu_stats->validation_ns / total_packets;
+    double avg_matches = nmu_stats->avg_matches / validations;
+    double coverage = nmu_get_coverage(nmucls);
 
-   double total_packets = nmu_stats->total_packets ?
-                          nmu_stats->total_packets : 1;
-   double validations = nmu_stats->num_validations ?
-                        nmu_stats->num_validations : 1;
-   double hit_rate = nmu_stats->hit_count / total_packets;
-   double parsing_ns = nmu_stats->parsing_ns / total_packets;
-   double remainder_ns = nmu_stats->remainder_ns / total_packets;
-   double inference_ns = nmu_stats->inference_ns / total_packets;
-   double search_ns = nmu_stats->search_ns / total_packets;
-   double validation_ns = nmu_stats->validation_ns / total_packets;
-   double avg_matches = nmu_stats->avg_matches / validations;
-
-   ds_put_format(reply,
-           "  NuevoMatchUp avg. hit rate: %.03f\n"
-           "  NuevoMatchUp avg. parsing time: %.03f ns\n"
-           "  NuevoMatchUp avg. inference time: %.03f ns\n"
-           "  NuevoMatchUp avg. search time: %.03f ns\n"
-           "  NuevoMatchUp avg. validation time: %.03f ns\n"
-           "  NuevoMatchUp avg. remainder time: %.03f ns\n"
-           "  NuevoMatchUp avg. matches per entry: %.03f\n",
-           hit_rate, parsing_ns, inference_ns,
-           search_ns, validation_ns, remainder_ns, avg_matches);
+    ds_put_format(reply,
+            "NuevoMatchUp avg. hit rate: %.03f%s"
+            "NuevoMatchUp coverage: %.2lf%s"
+            "NuevoMatchUp avg. parsing time: %.03f ns%s"
+            "NuevoMatchUp avg. inference time: %.03f ns%s"
+            "NuevoMatchUp avg. search time: %.03f ns%s"
+            "NuevoMatchUp avg. validation time: %.03f ns%s"
+            "NuevoMatchUp avg. remainder time: %.03f ns%s"
+            "NuevoMatchUp avg. matches per entry: %.03f%s",
+            hit_rate, sep, coverage, sep, parsing_ns, sep, inference_ns, sep,
+            search_ns, sep, validation_ns, sep,
+            remainder_ns, sep, avg_matches, sep);
 }
 
 static struct cmpflow_item*
@@ -3018,11 +2856,11 @@ nmucls_run__(struct nmucls *nmucls)
 
     /* Initiate trainer thread */
     ds_init(&ds);
-    ds_put_format(&ds, "nmu-trainer-pmd");
-    nmucls->trainer_thread = ovs_thread_create(ds_cstr(&ds),
+    ds_put_format(&ds, "nmu-manager-pmd");
+    nmucls->manager_thread = ovs_thread_create(ds_cstr(&ds),
                                                nmucls_thread_main,
                                                nmucls);
-    VLOG_INFO("NuevoMatchUp trainer thread for PMD created.");
+    VLOG_INFO("NuevoMatchUp manager thread for PMD created.");
     nmucls->thread_running = true;
     ds_destroy(&ds);
 }
@@ -3411,6 +3249,8 @@ nmucls_thread_main(void* args)
         nmucls->cfg->use_cmpflows = 0;
     }
 
+    trainer_thread_ref();
+
     while(nmucls->enabled) {
 
         xnanosleep(ns_to_wait + ns_penalty);
@@ -3423,7 +3263,12 @@ nmucls_thread_main(void* args)
         }
 
         nmu_preprocess_rules(nmucls);
-        nmu_train(nmucls, &result);
+
+        /* When training occurs here; does not scale to many manager threads */
+        /* nmu_train(nmucls, &result); */
+        /* Producer-consumer to a single trainer thread */
+        result = trainer_thread_produce(nmucls);
+
         nmu_postprocess_rules(nmucls);
         nmu_move_rules_from_isets(nmucls);
         nmu_switch(nmucls);
@@ -3471,8 +3316,147 @@ nmucls_thread_main(void* args)
     }
 
     cmpflow_clean(nmucls, true);
-    VLOG_INFO("NuevoMatch trainer exit");
+    trainer_thread_unref();
+
+    VLOG_INFO("NuevoMatch PMD manager exit");
     return NULL;
+}
+
+
+/* Trainer thread */
+
+#define TRAINER_SLEEP_NS 10000
+
+enum { TRAINER_RING_SIZE = 32 };
+enum trainer_status {
+    TRAINER_STATUS_EMPTY = 0,
+    TRAINER_STATUS_FULL,
+    TRAINER_STATUS_READY
+};
+
+/* Trainer thread ring element */
+OVS_ALIGNED_STRUCT(CACHE_LINE_SIZE, trainer_ring_element) {
+    struct nmucls *nmucls;
+    enum trainer_status status;
+    bool result;
+};
+
+/* Trainer ring */
+static struct trainer_ring_element trainer_ring[TRAINER_RING_SIZE];
+static atomic_int trainer_cursor_write;
+static struct ovs_mutex trainer_write_lock;
+
+/* Trainer thread */
+static atomic_int trainer_thread_client_num = 0;
+
+static pthread_t trainer_thread;
+
+/* Trainer thread main loop */
+static void* trainer_thread_main(void *args __always_unused)
+{
+    struct trainer_ring_element *elem;
+    struct trainer_ring_element new;
+    int client_no;
+    int read_cursor;
+
+    VLOG_INFO("NMU trainer thread start");
+    read_cursor = 0;
+
+    while (1) {
+        atomic_read_relaxed(&trainer_thread_client_num, &client_no);
+        if (!client_no) {
+            break;
+        }
+
+        xnanosleep(TRAINER_SLEEP_NS);
+
+        elem = &trainer_ring[read_cursor];
+        if (elem->status != TRAINER_STATUS_FULL) {
+            continue;
+        }
+
+        new = *elem;
+        nmu_train(new.nmucls, &new.result);
+        new.status = TRAINER_STATUS_READY;
+
+        /* Write to ring, single cache line */
+        *elem = new;
+        read_cursor = (read_cursor + 1) & (TRAINER_RING_SIZE-1);
+    }
+
+    VLOG_INFO("NMU trainer thread exit");
+    return NULL;
+}
+
+/* Produce to ring, waits and returns "nmu_train" result */
+static bool trainer_thread_produce(struct nmucls *nmucls)
+{
+    struct trainer_ring_element *elem;
+    struct trainer_ring_element new;
+    int write_cursor;
+
+    /* Lock on ring, wait for current slot to be empty */
+    ovs_mutex_lock(&trainer_write_lock);
+
+    atomic_add_relaxed(&trainer_cursor_write, 1, &write_cursor);
+    write_cursor &= (TRAINER_RING_SIZE-1);
+    elem = &trainer_ring[write_cursor];
+
+    while (elem->status != TRAINER_STATUS_EMPTY) {
+        xnanosleep(TRAINER_RING_SIZE * TRAINER_SLEEP_NS);
+    }
+    
+    /* Write to ring, unlock */
+    new.nmucls = nmucls;
+    new.status = TRAINER_STATUS_FULL;
+    *elem = new;
+    ovs_mutex_unlock(&trainer_write_lock);
+
+    /* Block reader untill slot is ready */
+    while (elem->status != TRAINER_STATUS_READY) {
+        xnanosleep(TRAINER_RING_SIZE * TRAINER_SLEEP_NS);
+    }
+
+    /* Update element status to empty */
+    elem->status = TRAINER_STATUS_EMPTY;
+
+    return elem->result;
+}
+
+/* Start the trainer thread */
+static void trainer_thread_ref(void)
+{
+    int old;
+
+    /* Register as a client */
+    atomic_add_relaxed(&trainer_thread_client_num, 1, &old);
+    if (old) {
+        return;
+    }
+
+    /* Initiate ring */
+    memset(&trainer_ring, 0, sizeof(trainer_ring));
+    atomic_store(&trainer_cursor_write, 0);
+    ovs_mutex_init(&trainer_write_lock);
+
+    /* Start trainer thread */
+    trainer_thread = ovs_thread_create("nmu-trainer",
+                                       trainer_thread_main,
+                                       NULL);
+}
+
+/* Decrease number of clients */
+static int trainer_thread_unref(void)
+{
+    int old;
+    atomic_sub_relaxed(&trainer_thread_client_num, 1, &old);
+    
+    /* Join with trainer thread */
+    if (old == 1) {
+        xpthread_join(trainer_thread, NULL);
+    }
+
+    return old;
 }
 
 #endif

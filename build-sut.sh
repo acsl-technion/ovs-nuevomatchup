@@ -1,5 +1,6 @@
 #!/bin/bash
 
+libnmu_version=1.0.3
 my_dir=$(readlink -f $PWD)
 ovs_dir=$my_dir/ovs
 dpdk_dir=$my_dir/dpdk
@@ -18,13 +19,10 @@ if [[ ! -e $dpdk_dir/build ]]; then
 fi
 
 if [[ ! -e $nmu_dir ]]; then
-    echo "Cloning libnuevomatchup..."
-    git clone git@github.com:alonrs/nuevomatchup.git
-    git -C $nmu_dir checkout revision
-    (cd $nmu_dir && ./build.sh)
-    make -C $nmu_dir -j4
-    sudo make -C $nmu_dir install
-    ln -s $nmu_dir/libcommon/lib/simd.h
+    zipname="libnuevomatchup-x86-64-linux-${libnmu_version}.zip"
+    echo "Downloading libnuevomatchup..."
+    wget "https://alonrashelbach.files.wordpress.com/2022/01/$zipname"
+    unzip $zipname -d $nmu_dir
 fi
 
 # Set configuration
@@ -35,20 +33,18 @@ if [[ ! -e scripts/.config ]]; then
 
     read -p "Enter RX PCI bus (LGEN->SUT): " pci_rx
     read -p "Enter TC PCI bus (SUT->LGEN): " pci_tx
-    read -p "Enter Open vSwitch PMD cores (e.g., 1-6): " pmd_cores
     echo "pci_rx=$pci_rx" >> scripts/.config
     echo "pci_tx=$pci_tx" >> scripts/.config
-    echo "pmd_cores=$pmd_cores" >> scripts/.config
 fi
 
 if [[ ! -e $ovs_dir ]]; then
     echo "Cloning OVS 2.13.1 into $ovs_dir..."
     git clone https://github.com/openvswitch/ovs.git $ovs_dir
     git -C $ovs_dir checkout tags/v2.13.1
-    git -C $ovs_dir apply ovs.patch
+    git -C $ovs_dir apply $my_dir/ovs.patch
 fi
 
-for f in dpif-netdev-nmu.c dpif-netdev-nmu.h simd.h; do
+for f in dpif-netdev-nmu.c dpif-netdev-nmu.h; do
     if [[ ! -e $ovs_dir/lib/$f ]]; then
         echo "Copying module $f into OVS..."
         ln -s $my_dir/$f $ovs_dir/lib/$f
@@ -62,6 +58,15 @@ if [[ ! -e $ovs_dir/config.status ]]; then
      ./configure CFLAGS="-mfma -mpopcnt -O2 -g" \
      --with-dpdk="$dpdk_dir/build")
 fi
+
+# These require sudo
+if [[ "$EUID" -ne 0 ]]; then
+    echo "Cannot continue setup; please run me as root"
+    exit 0
+fi
+
+echo "Installing libnuevomatchup..."
+(cd $nmu_dir && sudo ./install.sh)
 
 echo "Building and installing OVS..."
 sudo make -C $ovs_dir install

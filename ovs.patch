@@ -392,7 +392,7 @@ index 68c33a0f9..ce7ce8606 100644
 +void dp_netdev_pmd_unlock(struct dp_netdev_pmd_thread *pmd);
 +void dp_netdev_pmd_unlock(struct dp_netdev_pmd_thread *pmd);
 +long long dp_netdev_pmd_now(struct dp_netdev_pmd_thread *pmd);
-+int dp_netdev_pmd_get_port_by_name(struct dp_netdev_pmd_thread *pmd, 
++int dp_netdev_pmd_get_port_by_name(struct dp_netdev_pmd_thread *pmd,
 +                                   const char *name,
 +                                   odp_port_t *port_no_p);
 +
@@ -419,7 +419,7 @@ index 68c33a0f9..ce7ce8606 100644
  #define NETDEV_FLOW_KEY_FOR_EACH_IN_FLOWMAP(VALUE, KEY, FLOWMAP)   \
      MINIFLOW_FOR_EACH_IN_FLOWMAP (VALUE, &(KEY)->mf, FLOWMAP)
 diff --git a/lib/dpif-netdev.c b/lib/dpif-netdev.c
-index 42e1c44ae..ab5cc8f2a 100644
+index 42e1c44ae..c172d3431 100644
 --- a/lib/dpif-netdev.c
 +++ b/lib/dpif-netdev.c
 @@ -42,6 +42,7 @@
@@ -516,7 +516,7 @@ index 42e1c44ae..ab5cc8f2a 100644
      /* These are atomic variables used as a synchronization and configuration
       * points for thread reload/exit.
       *
-@@ -1017,6 +1019,42 @@ format_pmd_thread(struct ds *reply, struct dp_netdev_pmd_thread *pmd)
+@@ -1017,6 +1019,58 @@ format_pmd_thread(struct ds *reply, struct dp_netdev_pmd_thread *pmd)
      ds_put_cstr(reply, ":\n");
  }
  
@@ -526,6 +526,8 @@ index 42e1c44ae..ab5cc8f2a 100644
 +{
 +    uint64_t stats[PMD_N_STATS];
 +    long long int elapsed;
++    double lookups_per_hit;
++    struct ds ds;
 +
 +    elapsed = time_msec() - pmd->log_timestamp;
 +    if (elapsed < pmd->dp->log_interval_ms) {
@@ -535,15 +537,27 @@ index 42e1c44ae..ab5cc8f2a 100644
 +
 +    pmd_perf_read_counters(&pmd->perf_stats, stats);
 +
++    lookups_per_hit = 0;
++    if (stats[PMD_STAT_MASKED_HIT] > 0) {
++        lookups_per_hit = stats[PMD_STAT_MASKED_LOOKUP]
++                            / (double) stats[PMD_STAT_MASKED_HIT];
++    }
++
++    ds_init(&ds);
++    nmucls_print_stats(&ds, pmd->nmucls, " ");
++
 +    VLOG_INFO("Extended stats: insertions: %lu deletions: %lu "
 +              "total-flows: %lu packets: %lu "
++              "subtables: %lf "
 +              "upcalls: %lu upcall-avg-us: %.2lf "
 +              "dfc-us: %.2lf fastpath-us: %.2lf execute-us: %.2lf "
-+              "dpcls-us: %.2lf lookup-us: %.2lf ",
++              "dpcls-us: %.2lf lookup-us: %.2lf "
++              "%s",
 +              stats[PMD_DELTA_INSERTIONS],
 +              stats[PMD_DELTA_DELETIONS],
 +              cmap_count(&pmd->flow_table),
 +              stats[PMD_DELTA_PACKETS],
++              lookups_per_hit,
 +              stats[PMD_DELTA_UPCALLS],
 +              stats[PMD_TIME_UPCALL] / (double) stats[PMD_DELTA_UPCALLS]
 +                                     / 1000.0,
@@ -551,24 +565,26 @@ index 42e1c44ae..ab5cc8f2a 100644
 +              stats[PMD_TIME_FAST_PATH] / 1000.0,
 +              stats[PMD_TIME_EXECUTE] / 1000.0,
 +              stats[PMD_TIME_DPCLS] / 1000.0,
-+              stats[PMD_TIME_FLOW_LOOKUP] / 1000.0);
++              stats[PMD_TIME_FLOW_LOOKUP] / 1000.0,
++              ds_cstr(&ds));
 +
++    nmucls_clear_stats(pmd->nmucls);
 +    pmd_perf_stats_clear_extended(&pmd->perf_stats);
 +}
 +
  static void
  pmd_info_show_stats(struct ds *reply,
                      struct dp_netdev_pmd_thread *pmd)
-@@ -1065,6 +1103,8 @@ pmd_info_show_stats(struct ds *reply,
+@@ -1065,6 +1119,8 @@ pmd_info_show_stats(struct ds *reply,
                    stats[PMD_STAT_MISS], stats[PMD_STAT_LOST],
                    packets_per_batch);
  
-+    nmucls_print_stats(reply, pmd->nmucls);
++    nmucls_print_stats(reply, pmd->nmucls, "\n  ");
 +
      if (total_cycles == 0) {
          return;
      }
-@@ -1605,6 +1645,8 @@ create_dp_netdev(const char *name, const struct dpif_class *class,
+@@ -1605,6 +1661,8 @@ create_dp_netdev(const char *name, const struct dpif_class *class,
          return error;
      }
  
@@ -577,7 +593,7 @@ index 42e1c44ae..ab5cc8f2a 100644
      dp->last_tnl_conf_seq = seq_read(tnl_conf_seq);
      *dpp = dp;
      return 0;
-@@ -1716,6 +1758,8 @@ dp_netdev_free(struct dp_netdev *dp)
+@@ -1716,6 +1774,8 @@ dp_netdev_free(struct dp_netdev *dp)
          ovs_mutex_destroy(&dp->meter_locks[i]);
      }
  
@@ -586,7 +602,7 @@ index 42e1c44ae..ab5cc8f2a 100644
      free(dp->pmd_cmask);
      free(CONST_CAST(char *, dp->name));
      free(dp);
-@@ -2112,7 +2156,7 @@ dp_netdev_flow_free(struct dp_netdev_flow *flow)
+@@ -2112,7 +2172,7 @@ dp_netdev_flow_free(struct dp_netdev_flow *flow)
      free(flow);
  }
  
@@ -595,7 +611,7 @@ index 42e1c44ae..ab5cc8f2a 100644
  {
      if (ovs_refcount_unref_relaxed(&flow->ref_cnt) == 1) {
          ovsrcu_postpone(dp_netdev_flow_free, flow);
-@@ -2159,6 +2203,14 @@ dp_netdev_pmd_find_dpcls(struct dp_netdev_pmd_thread *pmd,
+@@ -2159,6 +2219,14 @@ dp_netdev_pmd_find_dpcls(struct dp_netdev_pmd_thread *pmd,
      return cls;
  }
  
@@ -610,7 +626,7 @@ index 42e1c44ae..ab5cc8f2a 100644
  #define MAX_FLOW_MARK       (UINT32_MAX - 1)
  #define INVALID_FLOW_MARK   0
  /* Zero flow mark is used to indicate the HW to remove the mark. A packet
-@@ -2591,24 +2643,36 @@ queue_netdev_flow_put(struct dp_netdev_pmd_thread *pmd,
+@@ -2591,24 +2659,36 @@ queue_netdev_flow_put(struct dp_netdev_pmd_thread *pmd,
      dp_netdev_append_flow_offload(offload);
  }
  
@@ -650,7 +666,7 @@ index 42e1c44ae..ab5cc8f2a 100644
      dp_netdev_flow_unref(flow);
  }
  
-@@ -2715,13 +2779,13 @@ dpif_netdev_port_poll_wait(const struct dpif *dpif_)
+@@ -2715,13 +2795,13 @@ dpif_netdev_port_poll_wait(const struct dpif *dpif_)
      seq_wait(dpif->dp->port_seq, dpif->last_port_seq);
  }
  
@@ -666,7 +682,7 @@ index 42e1c44ae..ab5cc8f2a 100644
  {
      return ovs_refcount_try_ref_rcu(&flow->ref_cnt);
  }
-@@ -2772,10 +2836,10 @@ netdev_flow_key_clone(struct netdev_flow_key *dst,
+@@ -2772,10 +2852,10 @@ netdev_flow_key_clone(struct netdev_flow_key *dst,
             offsetof(struct netdev_flow_key, mf) + src->len);
  }
  
@@ -681,7 +697,7 @@ index 42e1c44ae..ab5cc8f2a 100644
  {
      uint64_t *dst = miniflow_values(&mask->mf);
      struct flowmap fmap;
-@@ -2783,11 +2847,11 @@ netdev_flow_mask_init(struct netdev_flow_key *mask,
+@@ -2783,11 +2863,11 @@ netdev_flow_mask_init(struct netdev_flow_key *mask,
      size_t idx;
  
      /* Only check masks that make sense for the flow. */
@@ -695,7 +711,7 @@ index 42e1c44ae..ab5cc8f2a 100644
  
          if (mask_u64) {
              flowmap_set(&mask->mf.map, idx, 1);
-@@ -2808,8 +2872,16 @@ netdev_flow_mask_init(struct netdev_flow_key *mask,
+@@ -2808,8 +2888,16 @@ netdev_flow_mask_init(struct netdev_flow_key *mask,
      mask->len = netdev_flow_key_size(n);
  }
  
@@ -713,7 +729,7 @@ index 42e1c44ae..ab5cc8f2a 100644
  netdev_flow_key_init_masked(struct netdev_flow_key *dst,
                              const struct flow *flow,
                              const struct netdev_flow_key *mask)
-@@ -2830,6 +2902,55 @@ netdev_flow_key_init_masked(struct netdev_flow_key *dst,
+@@ -2830,6 +2918,55 @@ netdev_flow_key_init_masked(struct netdev_flow_key *dst,
                              (dst_u64 - miniflow_get_values(&dst->mf)) * 8);
  }
  
@@ -730,7 +746,7 @@ index 42e1c44ae..ab5cc8f2a 100644
 +}
 +
 +int
-+dp_netdev_pmd_get_port_by_name(struct dp_netdev_pmd_thread *pmd, 
++dp_netdev_pmd_get_port_by_name(struct dp_netdev_pmd_thread *pmd,
 +                               const char *name,
 +                               odp_port_t *port_no_p)
 +{
@@ -769,7 +785,7 @@ index 42e1c44ae..ab5cc8f2a 100644
  static inline bool
  emc_entry_alive(struct emc_entry *ce)
  {
-@@ -3013,17 +3134,20 @@ dp_netdev_pmd_lookup_flow(struct dp_netdev_pmd_thread *pmd,
+@@ -3013,17 +3150,20 @@ dp_netdev_pmd_lookup_flow(struct dp_netdev_pmd_thread *pmd,
                            const struct netdev_flow_key *key,
                            int *lookup_num_p)
  {
@@ -796,7 +812,7 @@ index 42e1c44ae..ab5cc8f2a 100644
      return netdev_flow;
  }
  
-@@ -3248,6 +3372,7 @@ dp_netdev_flow_to_dpif_flow(const struct dp_netdev *dp,
+@@ -3248,6 +3388,7 @@ dp_netdev_flow_to_dpif_flow(const struct dp_netdev *dp,
      flow->ufid = netdev_flow->ufid;
      flow->ufid_present = true;
      flow->pmd_id = netdev_flow->pmd_id;
@@ -804,7 +820,7 @@ index 42e1c44ae..ab5cc8f2a 100644
  
      get_dpif_flow_status(dp, netdev_flow, &flow->stats, &flow->attrs);
      flow->attrs.dp_extra_info = netdev_flow->dp_extra_info;
-@@ -3384,10 +3509,11 @@ dp_netdev_get_mega_ufid(const struct match *match, ovs_u128 *mega_ufid)
+@@ -3384,10 +3525,11 @@ dp_netdev_get_mega_ufid(const struct match *match, ovs_u128 *mega_ufid)
      odp_flow_key_hash(&masked_flow, sizeof masked_flow, mega_ufid);
  }
  
@@ -818,7 +834,7 @@ index 42e1c44ae..ab5cc8f2a 100644
      OVS_REQUIRES(pmd->flow_mutex)
  {
      struct ds extra_info = DS_EMPTY_INITIALIZER;
-@@ -3435,8 +3561,15 @@ dp_netdev_flow_add(struct dp_netdev_pmd_thread *pmd,
+@@ -3435,8 +3577,15 @@ dp_netdev_flow_add(struct dp_netdev_pmd_thread *pmd,
      netdev_flow_key_init_masked(&flow->cr.flow, &match->flow, &mask);
  
      /* Select dpcls for in_port. Relies on in_port to be exact match. */
@@ -836,7 +852,7 @@ index 42e1c44ae..ab5cc8f2a 100644
  
      ds_put_cstr(&extra_info, "miniflow_bits(");
      FLOWMAP_FOR_EACH_UNIT (unit) {
-@@ -3447,6 +3580,7 @@ dp_netdev_flow_add(struct dp_netdev_pmd_thread *pmd,
+@@ -3447,6 +3596,7 @@ dp_netdev_flow_add(struct dp_netdev_pmd_thread *pmd,
                        count_1bits(flow->cr.mask->mf.map.bits[unit]));
      }
      ds_put_char(&extra_info, ')');
@@ -844,7 +860,7 @@ index 42e1c44ae..ab5cc8f2a 100644
      flow->dp_extra_info = ds_steal_cstr(&extra_info);
      ds_destroy(&extra_info);
  
-@@ -3523,7 +3657,7 @@ flow_put_on_pmd(struct dp_netdev_pmd_thread *pmd,
+@@ -3523,7 +3673,7 @@ flow_put_on_pmd(struct dp_netdev_pmd_thread *pmd,
          if (put->flags & DPIF_FP_CREATE) {
              if (cmap_count(&pmd->flow_table) < MAX_FLOWS) {
                  dp_netdev_flow_add(pmd, match, ufid, put->actions,
@@ -853,7 +869,7 @@ index 42e1c44ae..ab5cc8f2a 100644
                  error = 0;
              } else {
                  error = EFBIG;
-@@ -3822,15 +3956,20 @@ dpif_netdev_flow_dump_next(struct dpif_flow_dump_thread *thread_,
+@@ -3822,15 +3972,20 @@ dpif_netdev_flow_dump_next(struct dpif_flow_dump_thread *thread_,
  
          do {
              for (n_flows = 0; n_flows < flow_limit; n_flows++) {
@@ -877,7 +893,7 @@ index 42e1c44ae..ab5cc8f2a 100644
              }
              /* When finishing dumping the current pmd thread, moves to
               * the next. */
-@@ -4086,6 +4225,17 @@ dpif_netdev_set_config(struct dpif *dpif, const struct smap *other_config)
+@@ -4086,6 +4241,17 @@ dpif_netdev_set_config(struct dpif *dpif, const struct smap *other_config)
          }
      }
  
@@ -895,7 +911,7 @@ index 42e1c44ae..ab5cc8f2a 100644
      bool pmd_rxq_assign_cyc = !strcmp(pmd_rxq_assign, "cycles");
      if (!pmd_rxq_assign_cyc && strcmp(pmd_rxq_assign, "roundrobin")) {
          VLOG_WARN("Unsupported Rxq to PMD assignment mode in pmd-rxq-assign. "
-@@ -4950,8 +5100,8 @@ reconfigure_pmd_threads(struct dp_netdev *dp)
+@@ -4950,8 +5116,8 @@ reconfigure_pmd_threads(struct dp_netdev *dp)
              ds_put_format(&name, "pmd-c%02d/id:", core->core_id);
              pmd->thread = ovs_thread_create(ds_cstr(&name),
                                              pmd_thread_main, pmd);
@@ -905,7 +921,7 @@ index 42e1c44ae..ab5cc8f2a 100644
              VLOG_INFO("PMD thread on numa_id: %d, core id: %2d created.",
                        pmd->numa_id, pmd->core_id);
              changed = true;
-@@ -6230,6 +6380,9 @@ dp_netdev_configure_pmd(struct dp_netdev_pmd_thread *pmd, struct dp_netdev *dp,
+@@ -6230,6 +6396,9 @@ dp_netdev_configure_pmd(struct dp_netdev_pmd_thread *pmd, struct dp_netdev *dp,
      pmd_perf_stats_init(&pmd->perf_stats);
      cmap_insert(&dp->poll_threads, CONST_CAST(struct cmap_node *, &pmd->node),
                  hash_int(core_id, 0));
@@ -915,7 +931,7 @@ index 42e1c44ae..ab5cc8f2a 100644
  }
  
  static void
-@@ -6237,6 +6390,7 @@ dp_netdev_destroy_pmd(struct dp_netdev_pmd_thread *pmd)
+@@ -6237,6 +6406,7 @@ dp_netdev_destroy_pmd(struct dp_netdev_pmd_thread *pmd)
  {
      struct dpcls *cls;
  
@@ -923,7 +939,7 @@ index 42e1c44ae..ab5cc8f2a 100644
      dp_netdev_pmd_flow_flush(pmd);
      hmap_destroy(&pmd->send_port_cache);
      hmap_destroy(&pmd->tnl_port_cache);
-@@ -6412,7 +6566,7 @@ dpif_netdev_get_datapath_version(void)
+@@ -6412,7 +6582,7 @@ dpif_netdev_get_datapath_version(void)
       return xstrdup("<built-in>");
  }
  
@@ -932,7 +948,7 @@ index 42e1c44ae..ab5cc8f2a 100644
  dp_netdev_flow_used(struct dp_netdev_flow *netdev_flow, int cnt, int size,
                      uint16_t tcp_flags, long long now)
  {
-@@ -6426,13 +6580,15 @@ dp_netdev_flow_used(struct dp_netdev_flow *netdev_flow, int cnt, int size,
+@@ -6426,13 +6596,15 @@ dp_netdev_flow_used(struct dp_netdev_flow *netdev_flow, int cnt, int size,
      atomic_store_relaxed(&netdev_flow->stats.tcp_flags, flags);
  }
  
@@ -950,7 +966,7 @@ index 42e1c44ae..ab5cc8f2a 100644
  
      if (OVS_UNLIKELY(!dp->upcall_cb)) {
          return ENODEV;
-@@ -6463,8 +6619,12 @@ dp_netdev_upcall(struct dp_netdev_pmd_thread *pmd, struct dp_packet *packet_,
+@@ -6463,8 +6635,12 @@ dp_netdev_upcall(struct dp_netdev_pmd_thread *pmd, struct dp_packet *packet_,
          ds_destroy(&ds);
      }
  
@@ -965,7 +981,7 @@ index 42e1c44ae..ab5cc8f2a 100644
  }
  
  static inline uint32_t
-@@ -6697,6 +6857,7 @@ dfc_processing(struct dp_netdev_pmd_thread *pmd,
+@@ -6697,6 +6873,7 @@ dfc_processing(struct dp_netdev_pmd_thread *pmd,
      pmd_perf_update_counter(&pmd->perf_stats,
                              md_is_valid ? PMD_STAT_RECIRC : PMD_STAT_RECV,
                              cnt);
@@ -973,7 +989,7 @@ index 42e1c44ae..ab5cc8f2a 100644
  
      DP_PACKET_BATCH_REFILL_FOR_EACH (i, cnt, packet, packets_) {
          struct dp_netdev_flow *flow;
-@@ -6805,6 +6966,7 @@ handle_packet_upcall(struct dp_netdev_pmd_thread *pmd,
+@@ -6805,6 +6982,7 @@ handle_packet_upcall(struct dp_netdev_pmd_thread *pmd,
                       const struct netdev_flow_key *key,
                       struct ofpbuf *actions, struct ofpbuf *put_actions)
  {
@@ -981,7 +997,7 @@ index 42e1c44ae..ab5cc8f2a 100644
      struct ofpbuf *add_actions;
      struct dp_packet_batch b;
      struct match match;
-@@ -6815,6 +6977,7 @@ handle_packet_upcall(struct dp_netdev_pmd_thread *pmd,
+@@ -6815,6 +6993,7 @@ handle_packet_upcall(struct dp_netdev_pmd_thread *pmd,
      match.tun_md.valid = false;
      miniflow_expand(&key->mf, &match.flow);
      memset(&match.wc, 0, sizeof match.wc);
@@ -989,7 +1005,7 @@ index 42e1c44ae..ab5cc8f2a 100644
  
      ofpbuf_clear(actions);
      ofpbuf_clear(put_actions);
-@@ -6822,8 +6985,14 @@ handle_packet_upcall(struct dp_netdev_pmd_thread *pmd,
+@@ -6822,8 +7001,14 @@ handle_packet_upcall(struct dp_netdev_pmd_thread *pmd,
      odp_flow_key_hash(&match.flow, sizeof match.flow, &ufid);
      error = dp_netdev_upcall(pmd, packet, &match.flow, &match.wc,
                               &ufid, DPIF_UC_MISS, NULL, actions,
@@ -1006,7 +1022,7 @@ index 42e1c44ae..ab5cc8f2a 100644
          dp_packet_delete(packet);
          COVERAGE_INC(datapath_drop_upcall_error);
          return error;
-@@ -6860,7 +7029,8 @@ handle_packet_upcall(struct dp_netdev_pmd_thread *pmd,
+@@ -6860,7 +7045,8 @@ handle_packet_upcall(struct dp_netdev_pmd_thread *pmd,
          if (OVS_LIKELY(!netdev_flow)) {
              netdev_flow = dp_netdev_flow_add(pmd, &match, &ufid,
                                               add_actions->data,
@@ -1016,7 +1032,7 @@ index 42e1c44ae..ab5cc8f2a 100644
          }
          ovs_mutex_unlock(&pmd->flow_mutex);
          uint32_t hash = dp_netdev_flow_hash(&netdev_flow->ufid);
-@@ -6894,26 +7064,23 @@ fast_path_processing(struct dp_netdev_pmd_thread *pmd,
+@@ -6894,26 +7080,23 @@ fast_path_processing(struct dp_netdev_pmd_thread *pmd,
      enum { PKT_ARRAY_SIZE = NETDEV_MAX_BURST };
  #endif
      struct dp_packet *packet;
@@ -1049,7 +1065,7 @@ index 42e1c44ae..ab5cc8f2a 100644
      if (OVS_UNLIKELY(any_miss) && !fat_rwlock_tryrdlock(&dp->upcall_rwlock)) {
          uint64_t actions_stub[512 / 8], slow_stub[512 / 8];
          struct ofpbuf actions, put_actions;
-@@ -6993,6 +7160,10 @@ fast_path_processing(struct dp_netdev_pmd_thread *pmd,
+@@ -6993,6 +7176,10 @@ fast_path_processing(struct dp_netdev_pmd_thread *pmd,
                              upcall_ok_cnt);
      pmd_perf_update_counter(&pmd->perf_stats, PMD_STAT_LOST,
                              upcall_fail_cnt);
@@ -1060,7 +1076,7 @@ index 42e1c44ae..ab5cc8f2a 100644
  }
  
  /* Packets enter the datapath from a port (or from recirculation) here.
-@@ -7022,8 +7193,12 @@ dp_netdev_input__(struct dp_netdev_pmd_thread *pmd,
+@@ -7022,8 +7209,12 @@ dp_netdev_input__(struct dp_netdev_pmd_thread *pmd,
      odp_port_t in_port;
  
      n_batches = 0;
@@ -1073,7 +1089,7 @@ index 42e1c44ae..ab5cc8f2a 100644
  
      if (!dp_packet_batch_is_empty(packets)) {
          /* Get ingress port from first packet's metadata. */
-@@ -7056,9 +7231,20 @@ dp_netdev_input__(struct dp_netdev_pmd_thread *pmd,
+@@ -7056,9 +7247,20 @@ dp_netdev_input__(struct dp_netdev_pmd_thread *pmd,
          batches[i].flow->batch = NULL;
      }
  
@@ -1094,7 +1110,7 @@ index 42e1c44ae..ab5cc8f2a 100644
  }
  
  static void
-@@ -7219,7 +7405,7 @@ dp_execute_userspace_action(struct dp_netdev_pmd_thread *pmd,
+@@ -7219,7 +7421,7 @@ dp_execute_userspace_action(struct dp_netdev_pmd_thread *pmd,
  
      error = dp_netdev_upcall(pmd, packet, flow, NULL, ufid,
                               DPIF_UC_ACTION, userdata, actions,
@@ -1103,7 +1119,7 @@ index 42e1c44ae..ab5cc8f2a 100644
      if (!error || error == ENOSPC) {
          dp_packet_batch_init_packet(&b, packet);
          dp_netdev_execute_actions(pmd, &b, should_steal, flow,
-@@ -8017,12 +8203,13 @@ dpif_dummy_register(enum dummy_level level)
+@@ -8017,12 +8219,13 @@ dpif_dummy_register(enum dummy_level level)
  
  /* Datapath Classifier. */
  
@@ -1120,7 +1136,7 @@ index 42e1c44ae..ab5cc8f2a 100644
  }
  
  /* Initializes 'cls' as a classifier that initially contains no classification
-@@ -8034,12 +8221,47 @@ dpcls_init(struct dpcls *cls)
+@@ -8034,12 +8237,47 @@ dpcls_init(struct dpcls *cls)
      pvector_init(&cls->subtables);
  }
  
@@ -1172,7 +1188,7 @@ index 42e1c44ae..ab5cc8f2a 100644
                  subtable->mask.hash);
      ovsrcu_postpone(dpcls_subtable_destroy_cb, subtable);
  }
-@@ -8055,7 +8277,9 @@ dpcls_destroy(struct dpcls *cls)
+@@ -8055,7 +8293,9 @@ dpcls_destroy(struct dpcls *cls)
  
          CMAP_FOR_EACH (subtable, cmap_node, &cls->subtables_map) {
              ovs_assert(cmap_count(&subtable->rules) == 0);
@@ -1183,7 +1199,7 @@ index 42e1c44ae..ab5cc8f2a 100644
          }
          cmap_destroy(&cls->subtables_map);
          pvector_destroy(&cls->subtables);
-@@ -8093,11 +8317,10 @@ dpcls_create_subtable(struct dpcls *cls, const struct netdev_flow_key *mask)
+@@ -8093,11 +8333,10 @@ dpcls_create_subtable(struct dpcls *cls, const struct netdev_flow_key *mask)
      }
  
      cmap_insert(&cls->subtables_map, &subtable->cmap_node, mask->hash);
@@ -1199,7 +1215,7 @@ index 42e1c44ae..ab5cc8f2a 100644
  
      return subtable;
  }
-@@ -8205,19 +8428,22 @@ dp_netdev_pmd_try_optimize(struct dp_netdev_pmd_thread *pmd,
+@@ -8205,19 +8444,22 @@ dp_netdev_pmd_try_optimize(struct dp_netdev_pmd_thread *pmd,
  }
  
  /* Insert 'rule' into 'cls'. */
@@ -1225,7 +1241,7 @@ index 42e1c44ae..ab5cc8f2a 100644
  dpcls_remove(struct dpcls *cls, struct dpcls_rule *rule)
  {
      struct dpcls_subtable *subtable;
-@@ -8226,12 +8452,12 @@ dpcls_remove(struct dpcls *cls, struct dpcls_rule *rule)
+@@ -8226,12 +8468,12 @@ dpcls_remove(struct dpcls *cls, struct dpcls_rule *rule)
  
      /* Get subtable from reference in rule->mask. */
      INIT_CONTAINER(subtable, rule->mask, mask);
@@ -1244,7 +1260,7 @@ index 42e1c44ae..ab5cc8f2a 100644
  }
  
  /* Inner loop for mask generation of a unit, see netdev_flow_key_gen_masks. */
-@@ -8300,9 +8526,12 @@ dpcls_rule_matches_key(const struct dpcls_rule *rule,
+@@ -8300,9 +8542,12 @@ dpcls_rule_matches_key(const struct dpcls_rule *rule,
   *
   * Returns true if all miniflows found a corresponding rule. */
  static bool
@@ -1259,7 +1275,7 @@ index 42e1c44ae..ab5cc8f2a 100644
  {
      /* The received 'cnt' miniflows are the search-keys that will be processed
       * to find a matching entry into the available subtables.
-@@ -8319,8 +8548,23 @@ dpcls_lookup(struct dpcls *cls, const struct netdev_flow_key *keys[],
+@@ -8319,8 +8564,23 @@ dpcls_lookup(struct dpcls *cls, const struct netdev_flow_key *keys[],
      memset(rules, 0, cnt * sizeof *rules);
  
      int lookups_match = 0, subtable_pos = 1;
@@ -1272,9 +1288,9 @@ index 42e1c44ae..ab5cc8f2a 100644
 +    if (!keys_map) {
 +        goto after_dpcls;
 +    }
-+
-+    PERF_FILL(dpcls_time);
  
++    PERF_FILL(dpcls_time);
++
 +    cls = dp_netdev_pmd_lookup_dpcls(pmd, in_port);
 +    if (OVS_UNLIKELY(!cls)) {
 +        memset(rules, 0, sizeof(*rules)*cnt);
@@ -1283,7 +1299,7 @@ index 42e1c44ae..ab5cc8f2a 100644
      /* The Datapath classifier - aka dpcls - is composed of subtables.
       * Subtables are dynamically created as needed when new rules are inserted.
       * Each subtable collects rules with matches on a specific subset of packet
-@@ -8329,6 +8573,11 @@ dpcls_lookup(struct dpcls *cls, const struct netdev_flow_key *keys[],
+@@ -8329,6 +8589,11 @@ dpcls_lookup(struct dpcls *cls, const struct netdev_flow_key *keys[],
       * search-key, the search for that key can stop because the rules are
       * non-overlapping. */
      PVECTOR_FOR_EACH (subtable, &cls->subtables) {
@@ -1295,7 +1311,7 @@ index 42e1c44ae..ab5cc8f2a 100644
          /* Call the subtable specific lookup function. */
          found_map = subtable->lookup_func(subtable, keys_map, keys, rules);
  
-@@ -8340,16 +8589,22 @@ dpcls_lookup(struct dpcls *cls, const struct netdev_flow_key *keys[],
+@@ -8340,16 +8605,22 @@ dpcls_lookup(struct dpcls *cls, const struct netdev_flow_key *keys[],
          /* Clear the found rules, and return early if all packets are found. */
          keys_map &= ~found_map;
          if (!keys_map) {
@@ -1387,27 +1403,6 @@ index add3aabcc..9fba61c4d 100644
 +   fi
 +   AM_CONDITIONAL([HAVE_NUEVOMATCHUP], [test "$HAVE_NUEVOMATCHUP" = yes])
 +   AC_SUBST([HAVE_NUEVOMATCHUP])])
-diff --git a/manpages.mk b/manpages.mk
-index dc201484c..54a3a82ad 100644
---- a/manpages.mk
-+++ b/manpages.mk
-@@ -104,7 +104,6 @@ utilities/bugtool/ovs-bugtool.8: \
- utilities/bugtool/ovs-bugtool.8.in:
- lib/ovs.tmac:
- 
--
- utilities/ovs-dpctl-top.8: \
- 	utilities/ovs-dpctl-top.8.in \
- 	lib/ovs.tmac
-@@ -155,8 +154,6 @@ lib/common-syn.man:
- lib/common.man:
- lib/ovs.tmac:
- 
--lib/ovs.tmac:
--
- utilities/ovs-testcontroller.8: \
- 	utilities/ovs-testcontroller.8.in \
- 	lib/common.man \
 diff --git a/ofproto/ofproto-dpif-upcall.c b/ofproto/ofproto-dpif-upcall.c
 index 3a290e491..31ec13fcc 100644
 --- a/ofproto/ofproto-dpif-upcall.c
@@ -1840,24 +1835,11 @@ index c9d5df34b..59c00b74f 100644
  
  void rule_dpif_credit_stats(struct rule_dpif *,
                              const struct dpif_flow_stats *, bool);
-diff --git a/ofproto/ofproto.h b/ofproto/ofproto.h
-index bac4a1c21..f5dee2ae5 100644
---- a/ofproto/ofproto.h
-+++ b/ofproto/ofproto.h
-@@ -307,7 +307,7 @@ int ofproto_port_dump_done(struct ofproto_port_dump *);
-           : (ofproto_port_dump_done(DUMP), false));         \
-         )
- 
--#define OFPROTO_FLOW_LIMIT_DEFAULT 200000
-+#define OFPROTO_FLOW_LIMIT_DEFAULT 600000
- #define OFPROTO_MAX_IDLE_DEFAULT 10000 /* ms */
- #define OFPROTO_MAX_REVALIDATOR_DEFAULT 500 /* ms */
- #define OFPROTO_MIN_REVALIDATE_PPS_DEFAULT 5
 diff --git a/vswitchd/vswitch.xml b/vswitchd/vswitch.xml
-index 3ddaaefda..b4ba5fd8e 100644
+index 3ddaaefda..7ff561017 100644
 --- a/vswitchd/vswitch.xml
 +++ b/vswitchd/vswitch.xml
-@@ -710,6 +710,118 @@
+@@ -710,6 +710,91 @@
            The feature is considered experimental.
          </p>
        </column>
@@ -1920,33 +1902,6 @@ index 3ddaaefda..b4ba5fd8e 100644
 +        </p>
 +        <p>
 +          Defaults to 0.
-+        </p>
-+      </column>
-+      <column name="other_config" key="nmu-sessions"
-+              type='{"type": "boolean"}'>
-+        <p>
-+          NuevoMatchUp number of training sessions per classifier.
-+        </p>
-+        <p>
-+          Defaults to 6.
-+        </p>
-+      </column>
-+      <column name="other_config" key="nmu-samples"
-+              type='{"type": "integer", "minInteger": 0, "maxInteger": 100}'>
-+        <p>
-+          NuevoMatchUp number of training samples per session.
-+        </p>
-+        <p>
-+          Defaults to 4000.
-+        </p>
-+      </column>
-+      <column name="other_config" key="nmu-batching"
-+              type='{"type": "boolean"}'>
-+        <p>
-+          NuevoMatchUp whether to use batch training.
-+        </p>
-+        <p>
-+          Defaults to false.
 +        </p>
 +      </column>
 +      <column name="other_config" key="nmu-use-cmpflows"
