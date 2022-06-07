@@ -1,5 +1,5 @@
 # Introduction                                                                     
-The official source code of the paper "Scaling Open vSwitch with a Computational Cache" (USENIX NSDI, 2022).
+The official source code of the paper [*Scaling Open vSwitch with a Computational Cache* (USENIX NSDI, 2022)](https://www.usenix.org/conference/nsdi22/presentation/rashelbach).
 
 This repo contains:                      
    * An OVS module that works with [libnuevomatchup](https://alonrashelbach.com/libnuevomatchup). The module's source code is available in [dpif-netdev-nmu.c](dpif-netdev-nmu.c) and [dpif-netdev-nmu.h](dpif-netdev-nmu.h).
@@ -26,3 +26,5 @@ Run ```sudo ./scripts/run-experiments.sh lgen NAME``` on the LGEN machine, where
 # License
 
 The OVS module is licensed under the MIT license.
+
+If used in academic paper, please cite [this](https://www.usenix.org/conference/nsdi22/presentation/rashelbach).
