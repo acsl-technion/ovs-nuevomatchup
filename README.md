@@ -11,7 +11,7 @@ This repo contains:
 Connect two machines back-to-back using DPDK supported NICs. The machines should also be connected to a shared LAN (e.g., via another NIC). This is essential for running the scripts.
 The *System Under Test* (SUT) machine must have an Intel CPU that supports both the AVX and POPCNT extensions.
 You must have a Linux OS with root permissions in both machines for building the environment.
-
+Contact me for a link to the ruleset artifacts, or create one of your own using  [these tools](https://alonrashelbach.com/2021/12/20/benchmarking-packet-classification-algorithms/).
 ### SUT machine
 Run ```sudo ./build-sut.sh```. This script downloads the relevant DPDK and OVS versions, installs *libnuevomatchup*, patches and compiles OVS, and installs it.
 

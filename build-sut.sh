@@ -1,6 +1,7 @@
 #!/bin/bash
 
-libnmu_version=1.0.3
+libnmu_version=1.0.4
+date=2022/03
 my_dir=$(readlink -f $PWD)
 ovs_dir=$my_dir/ovs
 dpdk_dir=$my_dir/dpdk
@@ -21,7 +22,7 @@ fi
 if [[ ! -e $nmu_dir ]]; then
     zipname="libnuevomatchup-x86-64-linux-${libnmu_version}.zip"
     echo "Downloading libnuevomatchup..."
-    wget "https://alonrashelbach.files.wordpress.com/2022/01/$zipname"
+    wget "https://alonrashelbach.files.wordpress.com/$date/$zipname"
     unzip $zipname -d $nmu_dir
 fi
 
