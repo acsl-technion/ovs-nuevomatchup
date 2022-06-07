@@ -1,7 +1,7 @@
 #!/bin/bash
 
-libnmu_version=1.0.4
-date=2022/03
+libnmu_version=1.0.5
+date=2022/04
 my_dir=$(readlink -f $PWD)
 ovs_dir=$my_dir/ovs
 dpdk_dir=$my_dir/dpdk
